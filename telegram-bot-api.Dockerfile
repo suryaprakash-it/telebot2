@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /var/lib/telegram-bot-api \
     && chown -R botapi:botapi /var/lib/telegram-bot-api
 COPY --from=build /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+COPY run-telegram-bot-api.sh /usr/local/bin/run-telegram-bot-api
+RUN chmod 0755 /usr/local/bin/run-telegram-bot-api
 USER botapi
 EXPOSE 8081
-ENTRYPOINT ["/usr/local/bin/telegram-bot-api"]
+ENTRYPOINT ["/usr/local/bin/run-telegram-bot-api"]

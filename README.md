@@ -40,6 +40,19 @@ The download endpoint does not impose a speed cap. It cannot guarantee 10 MB/s: 
 
 Open the bot in Telegram and send or forward a file. The bot replies with its download page. Anyone who has the link can download that file, so treat links as private bearer credentials.
 
+## Deploying on Render
+
+The Compose hostname `telegram-bot-api` only exists inside Docker Compose. If the app alone is deployed to Render, DNS fails with `Cannot connect to host telegram-bot-api:8081`.
+
+For Render, run both processes in one Web Service so the app can read the local Bot API's downloaded files:
+
+1. Set the service's Dockerfile path to `render.Dockerfile` and keep it as a **Web Service**.
+2. Add `BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ARCHIVE_CHAT_ID`, `PUBLIC_BASE_URL`, and `BOT_USERNAME` in the Render environment settings.
+3. Attach a persistent disk at `/var/lib/telegram-bot-api`. The Render Dockerfile defaults `DATABASE_PATH`, `BOT_API_DATA_DIR`, and `TELEGRAM_API_BASE_URL` to paths and the localhost API endpoint on that disk. If you already set these variables in Render, change them to `/var/lib/telegram-bot-api/files.sqlite3`, `/var/lib/telegram-bot-api`, and `http://127.0.0.1:8081` respectively.
+4. Redeploy. `run-render.sh` starts the local Telegram Bot API and the download app in the same container. Render supplies `PORT` for the public web server.
+
+This approach avoids the unresolved `telegram-bot-api` hostname and keeps the local Bot API's file cache accessible to the app. Persistent disks may require a paid Render plan; see Render's [disk guide](https://render.com/docs/disks). Do not use the public `https://api.telegram.org` endpoint for this large-file setup: its Bot API download limit is 20 MB.
+
 ## Configuration
 
 | Variable | Purpose |
