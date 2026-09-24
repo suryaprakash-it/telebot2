@@ -34,7 +34,7 @@ BOT_API_DATA_DIR = Path(os.getenv("BOT_API_DATA_DIR", "/var/lib/telegram-bot-api
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(4 * 1024**3)))
 CACHE_TTL_SECONDS = max(1, int(os.getenv("CACHE_TTL_HOURS", "24"))) * 60 * 60
 CACHE_CONCURRENCY = max(1, int(os.getenv("CACHE_CONCURRENCY", "1")))
-STREAM_CONCURRENCY = max(1, int(os.getenv("STREAM_CONCURRENCY", "2")))
+STREAM_CONCURRENCY = max(1, int(os.getenv("STREAM_CONCURRENCY", "8")))
 TELETHON_SESSION_PATH = Path(
     os.getenv("TELETHON_SESSION_PATH", str(DATABASE_PATH.parent / "telegram-stream"))
 )

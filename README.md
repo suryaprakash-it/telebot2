@@ -15,7 +15,7 @@ A small self-hosted Telegram bot that copies incoming files into a private Teleg
 
 Telegram permits uploads up to 2 GB for regular accounts and 4 GB for Premium accounts. The official cloud Bot API only downloads files up to 20 MB. Its local Bot API server can download files without a size limit, but its documented upload limit is 2,000 MB. This project uses `copyMessage` to copy an already received Telegram message into the archive instead of uploading the media again. The web app uses Telethon's MTProto chunked download client to stream data as the browser requests it; the client disables update delivery so the local Bot API continues polling for messages. Premium is needed for a user to send a 4 GB file to Telegram in the first place. Check 4 GB forwarding with your deployed Bot API version before relying on it for important files.
 
-The download endpoint does not impose a speed cap. It cannot guarantee 10 MB/s: download speed depends on Telegram's delivery, the host's network, the public reverse proxy, and the recipient's connection. Sustaining 10 MB/s requires at least 80 Mbps of usable throughput at every part of that path. Browser range support allows compatible download tools to resume and request parts of the file; it does not create bandwidth.
+The download endpoint does not impose a speed cap. It allows up to 8 simultaneous Telegram range streams by default, which lets download managers use parallel connections. Set the download manager's connection count to 8 or less to use this. This can help when a single stream is latency-limited, but cannot guarantee 10 MB/s: Telegram, the host, the public route, and the recipient must each sustain at least 80 Mbps. Browser range support helps compatible tools resume and request parts of a file; it does not create bandwidth.
 
 ## Setup
 
@@ -66,7 +66,7 @@ This approach avoids the unresolved `telegram-bot-api` hostname. The Telethon se
 | `MAX_FILE_BYTES` | Maximum accepted size; defaults to 4 GiB. |
 | `CACHE_TTL_HOURS` | Hours without a download before a local cache copy is removed; defaults to 24. The Telegram archive and link remain. |
 | `CACHE_CONCURRENCY` | Number of fallback local Bot API cache jobs to run simultaneously; defaults to 1. |
-| `STREAM_CONCURRENCY` | Number of direct Telegram streams to serve at once; defaults to 2. |
+| `STREAM_CONCURRENCY` | Maximum number of concurrent direct Telegram range streams; defaults to 8. |
 | `TELETHON_SESSION_PATH` | Path prefix for the persistent Telethon bot session; defaults to a file beside `DATABASE_PATH`. |
 | `DATABASE_PATH` | SQLite metadata database. |
 | `BOT_API_DATA_DIR` | Shared local Bot API directory where downloaded files are cached. |
