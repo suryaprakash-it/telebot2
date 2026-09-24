@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import quote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from telethon import TelegramClient, utils as telethon_utils
 
 
 logging.basicConfig(
@@ -33,6 +34,10 @@ BOT_API_DATA_DIR = Path(os.getenv("BOT_API_DATA_DIR", "/var/lib/telegram-bot-api
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(4 * 1024**3)))
 CACHE_TTL_SECONDS = max(1, int(os.getenv("CACHE_TTL_HOURS", "24"))) * 60 * 60
 CACHE_CONCURRENCY = max(1, int(os.getenv("CACHE_CONCURRENCY", "1")))
+STREAM_CONCURRENCY = max(1, int(os.getenv("STREAM_CONCURRENCY", "2")))
+TELETHON_SESSION_PATH = Path(
+    os.getenv("TELETHON_SESSION_PATH", str(DATABASE_PATH.parent / "telegram-stream"))
+)
 PORT = int(os.getenv("PORT", "8080"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 ALLOWED_USERS = {
@@ -48,9 +53,11 @@ if not API_ID or not API_HASH:
     raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH are required for the local Bot API server")
 
 HTTP: ClientSession | None = None
+STREAM_CLIENT: TelegramClient | None = None
 OFFSET = 0
 FILE_TASKS: dict[str, asyncio.Task[Path]] = {}
 CACHE_SEMAPHORE = asyncio.Semaphore(CACHE_CONCURRENCY)
+STREAM_SEMAPHORE = asyncio.Semaphore(STREAM_CONCURRENCY)
 
 
 def db_connect() -> sqlite3.Connection:
@@ -363,10 +370,9 @@ async def on_message(message: dict[str, Any]) -> None:
     await send_message(
         chat_id,
         f"<b>File archived.</b> Your download link is ready:\n\n<a href=\"{escape(link)}\">{escape(link)}</a>\n\n"
-        "The server is preparing the download in the background. The page will enable the download button when it is ready. This link has no expiry.",
+        "The download page is ready. The server streams file data to your browser from Telegram as it arrives. This link has no expiry.",
         {"inline_keyboard": [[{"text": "Open download page", "url": link}]]},
     )
-    start_materialize(media["file_id"])
 
 
 async def poll_updates() -> None:
@@ -412,9 +418,6 @@ async def file_page(request: web.Request) -> web.Response:
     record = get_file(token)
     if record is None:
         raise web.HTTPNotFound(text="This download link was not found.")
-    if record.get("cache_error"):
-        clear_cache_error(record["file_id"])
-        start_materialize(record["file_id"])
     template = (ROOT / "templates" / "home.html").read_text(encoding="utf-8")
     suffix = Path(record["name"]).suffix.lstrip(".").upper() or "FILE"
     replacements = {
@@ -444,18 +447,162 @@ async def file_status(request: web.Request) -> web.Response:
             ready = path.is_relative_to(BOT_API_DATA_DIR) and path.is_file()
         except OSError:
             ready = False
-    if not ready and not record.get("cache_error"):
-        start_materialize(record["file_id"])
+    if not ready and STREAM_CLIENT is not None:
+        ready = STREAM_CLIENT.is_connected()
     return web.json_response(
-        {"ready": ready, "failed": bool(record.get("cache_error")), "error": record.get("cache_error")},
+        {"ready": ready, "failed": bool(record.get("cache_error")) and not ready, "error": record.get("cache_error")},
         headers={"Cache-Control": "no-store"},
     )
+
+
+def parse_byte_range(value: str | None, size: int) -> tuple[int, int, int]:
+    if not value:
+        return 0, max(0, size - 1), 200
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("Unsupported byte range")
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or (not match.group(1) and not match.group(2)):
+        raise ValueError("Invalid byte range")
+    first, last = match.groups()
+    if not first:
+        suffix = int(last)
+        if suffix <= 0 or size <= 0:
+            raise ValueError("Invalid suffix range")
+        start = max(0, size - suffix)
+        end = size - 1
+    else:
+        start = int(first)
+        end = int(last) if last else size - 1
+        if start >= size or end < start:
+            raise ValueError("Range is outside the file")
+        end = min(end, size - 1)
+    return start, end, 206
+
+
+def cached_path(record: dict[str, Any]) -> Path | None:
+    cached = record.get("cached_path")
+    if not cached:
+        return None
+    try:
+        path = Path(cached).resolve(strict=True)
+        if path.is_relative_to(BOT_API_DATA_DIR) and path.is_file():
+            return path
+    except OSError:
+        pass
+    return None
+
+
+async def telegram_media_for_record(record: dict[str, Any]) -> Any:
+    if STREAM_CLIENT is None:
+        raise TelegramError("The direct Telegram streaming connection is unavailable")
+    try:
+        message = await STREAM_CLIENT.get_messages(
+            int(record["archive_chat_id"]),
+            ids=int(record["archive_message_id"]),
+        )
+        if message is not None and message.media is not None:
+            return message
+    except Exception as exc:
+        log.debug("Could not refresh media from the archive message: %s", exc)
+    media = telethon_utils.resolve_bot_file_id(record["file_id"])
+    if media is None:
+        raise TelegramError("Telethon could not read the Telegram file identifier")
+    return media
+
+
+async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> web.StreamResponse:
+    if STREAM_CLIENT is None or not STREAM_CLIENT.is_connected():
+        raise TelegramError("The direct Telegram streaming connection is unavailable")
+    size = record.get("size_bytes")
+    if size is None:
+        raise TelegramError("The file size is unavailable, so it cannot be streamed")
+    size = int(size)
+    try:
+        start, end, status = parse_byte_range(request.headers.get("Range"), size)
+    except ValueError:
+        return web.Response(status=416, headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
+
+    length = max(0, end - start + 1)
+    headers = {
+        "Content-Type": mimetypes.guess_type(record["name"])[0] or "application/octet-stream",
+        "Content-Disposition": content_disposition(record["name"]),
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+    }
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    if request.method == "HEAD" or length == 0:
+        return web.Response(status=status, headers=headers)
+
+    media = await telegram_media_for_record(record)
+    chunk_size = 512 * 1024
+    response = web.StreamResponse(status=status, headers=headers)
+    stream = None
+    async with STREAM_SEMAPHORE:
+        try:
+            stream = STREAM_CLIENT.iter_download(
+                media,
+                offset=start,
+                chunk_size=chunk_size,
+                request_size=chunk_size,
+                file_size=size,
+            )
+            first = await stream.__anext__()
+            await response.prepare(request)
+            remaining = length
+            first = first[:remaining]
+            if first:
+                await response.write(first)
+                remaining -= len(first)
+            async for chunk in stream:
+                if remaining <= 0:
+                    break
+                data = chunk[:remaining]
+                if data:
+                    await response.write(data)
+                    remaining -= len(data)
+            if remaining:
+                log.warning("Telegram stream ended %s bytes early for file %s", remaining, record["name"])
+            await response.write_eof()
+            touch_file_cache(record["file_id"])
+            return response
+        except Exception:
+            if response.prepared:
+                log.exception("Telegram stream ended after the browser response started")
+                response.force_close()
+                return response
+            raise
+        finally:
+            if stream is not None:
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
 
 
 async def download(request: web.Request) -> web.StreamResponse:
     record = get_file(request.match_info["token"])
     if record is None:
         raise web.HTTPNotFound(text="This download link was not found.")
+    path = cached_path(record)
+    if path is not None:
+        touch_file_cache(record["file_id"])
+        content_type = mimetypes.guess_type(record["name"])[0] or "application/octet-stream"
+        headers = {
+            "Content-Type": content_type,
+            "Content-Disposition": content_disposition(record["name"]),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Accept-Ranges": "bytes",
+        }
+        return web.FileResponse(path, headers=headers, chunk_size=1024 * 1024)
+    try:
+        return await stream_telegram_file(request, record)
+    except Exception as stream_error:
+        log.warning("Direct Telegram streaming unavailable; falling back to local Bot API staging: %s", stream_error)
     try:
         path = await cached_file(record)
     except Exception as exc:
@@ -496,7 +643,7 @@ async def cache_cleanup_loop() -> None:
 
 
 async def start_app() -> None:
-    global HTTP, OFFSET
+    global HTTP, OFFSET, STREAM_CLIENT
     initialize_db()
     OFFSET = load_offset()
     timeout = ClientTimeout(total=None, connect=30, sock_read=None)
@@ -516,6 +663,27 @@ async def start_app() -> None:
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
         log.info("Download website listening on port %s", PORT)
+        try:
+            TELETHON_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            STREAM_CLIENT = TelegramClient(
+                str(TELETHON_SESSION_PATH),
+                int(API_ID),
+                API_HASH,
+                receive_updates=False,
+                request_retries=5,
+                connection_retries=5,
+            )
+            await STREAM_CLIENT.start(bot_token=BOT_TOKEN)
+            try:
+                await STREAM_CLIENT.get_dialogs(limit=1000)
+            except Exception:
+                log.exception("Could not warm Telegram archive channel access for direct downloads")
+            log.info("Telegram direct streaming connected with update delivery disabled")
+        except Exception:
+            log.exception("Could not start Telegram direct streaming; downloads will use the local Bot API staging fallback")
+            if STREAM_CLIENT is not None:
+                await STREAM_CLIENT.disconnect()
+                STREAM_CLIENT = None
         cleanup_task = asyncio.create_task(cache_cleanup_loop(), name="file-cache-cleanup")
         await poll_updates()
     finally:
@@ -526,6 +694,9 @@ async def start_app() -> None:
         if HTTP is not None:
             await HTTP.close()
             HTTP = None
+        if STREAM_CLIENT is not None:
+            await STREAM_CLIENT.disconnect()
+            STREAM_CLIENT = None
 
 
 if __name__ == "__main__":
