@@ -500,9 +500,8 @@ async def start_app() -> None:
     initialize_db()
     OFFSET = load_offset()
     timeout = ClientTimeout(total=None, connect=30, sock_read=None)
-    HTTP = ClientSession(timeout=timeout)
     app = web.Application(client_max_size=1024 * 1024)
-    app.router.add_static("/static/", ROOT / "static", show_index=False, cache_max_age=86400)
+    app.router.add_static("/static/", ROOT / "static", show_index=False)
     app.router.add_get("/", landing)
     app.router.add_get("/healthz", health)
     app.router.add_get("/status/{token}", file_status)
@@ -511,18 +510,22 @@ async def start_app() -> None:
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info("Download website listening on port %s", PORT)
-    cleanup_task = asyncio.create_task(cache_cleanup_loop(), name="file-cache-cleanup")
+    cleanup_task: asyncio.Task[None] | None = None
     try:
+        HTTP = ClientSession(timeout=timeout)
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        log.info("Download website listening on port %s", PORT)
+        cleanup_task = asyncio.create_task(cache_cleanup_loop(), name="file-cache-cleanup")
         await poll_updates()
     finally:
-        cleanup_task.cancel()
-        await asyncio.gather(cleanup_task, return_exceptions=True)
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
         await runner.cleanup()
-        await HTTP.close()
-        HTTP = None
+        if HTTP is not None:
+            await HTTP.close()
+            HTTP = None
 
 
 if __name__ == "__main__":
