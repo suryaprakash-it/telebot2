@@ -674,10 +674,6 @@ async def start_app() -> None:
                 connection_retries=5,
             )
             await STREAM_CLIENT.start(bot_token=BOT_TOKEN)
-            try:
-                await STREAM_CLIENT.get_dialogs(limit=1000)
-            except Exception:
-                log.exception("Could not warm Telegram archive channel access for direct downloads")
             log.info("Telegram direct streaming connected with update delivery disabled")
         except Exception:
             log.exception("Could not start Telegram direct streaming; downloads will use the local Bot API staging fallback")
