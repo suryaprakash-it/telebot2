@@ -46,7 +46,7 @@ The Compose hostname `telegram-bot-api` only exists inside Docker Compose. If th
 
 For Render, run both processes in one Web Service so the app can read the local Bot API's downloaded files:
 
-1. Set the service's Dockerfile path to `render.Dockerfile` and keep it as a **Web Service**.
+1. Set the service's Dockerfile path to `render.Dockerfile` and keep it as a **Web Service**. Clear any Render Start Command or Docker Command override so the Dockerfile command runs both processes.
 2. Add `BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ARCHIVE_CHAT_ID`, `PUBLIC_BASE_URL`, and `BOT_USERNAME` in the Render environment settings.
 3. Attach a persistent disk at `/var/lib/telegram-bot-api`. The Render Dockerfile defaults `DATABASE_PATH`, `BOT_API_DATA_DIR`, and `TELEGRAM_API_BASE_URL` to paths and the localhost API endpoint on that disk. If you already set these variables in Render, change them to `/var/lib/telegram-bot-api/files.sqlite3`, `/var/lib/telegram-bot-api`, and `http://127.0.0.1:8081` respectively.
 4. Redeploy. `run-render.sh` starts the local Telegram Bot API and the download app in the same container. Render supplies `PORT` for the public web server.
