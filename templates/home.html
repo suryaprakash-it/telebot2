@@ -1,1 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1020">
+  <meta name="robots" content="noindex,nofollow">
+  <title>{{ name }} · DropLink</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/download-state.css">
+</head>
+<body>
+  <main class="shell">
+    <nav class="topbar">
+      <a class="brand" href="/"><span class="brand-mark">↗</span> DROP<span class="brand-light">LINK</span></a>
+      <span class="secure"><i></i> PRIVATE DOWNLOAD</span>
+    </nav>
 
+    <section class="hero">
+      <div class="eyebrow"><span class="eyebrow-dot"></span> YOUR FILE IS READY</div>
+      <h1>One file.<br><span>One simple link.</span></h1>
+      <p class="intro">Download directly through your browser. The file is streamed from its Telegram archive as your download begins.</p>
+    </section>
+
+    <section class="file-card" aria-label="File details">
+      <div class="file-top">
+        <div class="file-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M7 3.75h6.5L19 9.3v10.95H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Z"/><path d="M13 4v5.5h5.5M8.5 14h7M8.5 17h7"/></svg>
+        </div>
+        <span class="file-type">{{ kind }}</span>
+      </div>
+      <h2 class="filename">{{ name }}</h2>
+      <div class="file-meta"><span>{{ size }}</span><span class="meta-sep"></span><span>Permanent link</span></div>
+      <a class="download-button" href="{{ download_url }}" aria-label="Download {{ name }}">
+        <span>Download file</span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.75v11.5m0 0 4.25-4.25M12 15.25l-4.25-4.25M4.75 16.5v3h14.5v-3"/></svg>
+      </a>
+      <div class="alt-actions">
+        <span>Browser download · Resume supported</span>
+        <button type="button" id="copy-link">Copy link</button>
+      </div>
+      <div class="toast" id="copy-status" role="status" aria-live="polite"></div>
+    </section>
+
+    <footer><span>Shared from a private Telegram archive</span><span class="footer-lock">🔒 Link has no expiry</span></footer>
+  </main>
+  <script>
+    const copyButton = document.getElementById('copy-link');
+    const copyStatus = document.getElementById('copy-status');
+    copyButton.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(window.location.href);
+        copyStatus.textContent = 'Link copied';
+      } catch (_) {
+        copyStatus.textContent = 'Copy the link from your browser address bar';
+      }
+    });
+  </script>
+</body>
+</html>
