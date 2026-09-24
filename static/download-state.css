@@ -1,0 +1,3 @@
+.download-state{padding-top:22px;color:#91a0ba;font-size:11px}
+.download-button{margin-top:10px}
+.download-button.disabled{opacity:.45;filter:saturate(.5);pointer-events:none}
