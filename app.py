@@ -35,6 +35,9 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(4 * 1024**3)))
 CACHE_TTL_SECONDS = max(1, int(os.getenv("CACHE_TTL_HOURS", "24"))) * 60 * 60
 CACHE_CONCURRENCY = max(1, int(os.getenv("CACHE_CONCURRENCY", "1")))
 STREAM_CONCURRENCY = max(1, int(os.getenv("STREAM_CONCURRENCY", "8")))
+STREAM_PIPELINE_CHUNKS = max(1, int(os.getenv("STREAM_PIPELINE_CHUNKS", "4")))
+STREAM_REQUEST_CONCURRENCY = max(1, int(os.getenv("STREAM_REQUEST_CONCURRENCY", "16")))
+STREAM_CHUNK_SIZE = 512 * 1024
 TELETHON_SESSION_PATH = Path(
     os.getenv("TELETHON_SESSION_PATH", str(DATABASE_PATH.parent / "telegram-stream"))
 )
@@ -58,6 +61,7 @@ OFFSET = 0
 FILE_TASKS: dict[str, asyncio.Task[Path]] = {}
 CACHE_SEMAPHORE = asyncio.Semaphore(CACHE_CONCURRENCY)
 STREAM_SEMAPHORE = asyncio.Semaphore(STREAM_CONCURRENCY)
+STREAM_REQUEST_SEMAPHORE = asyncio.Semaphore(STREAM_REQUEST_CONCURRENCY)
 
 
 def db_connect() -> sqlite3.Connection:
@@ -510,6 +514,29 @@ async def telegram_media_for_record(record: dict[str, Any]) -> Any:
     return media
 
 
+async def telegram_file_chunk(media: Any, offset: int, file_size: int) -> bytes:
+    """Fetch one Telegram-aligned block while sharing a bounded request pool."""
+    if STREAM_CLIENT is None:
+        raise TelegramError("The direct Telegram streaming connection is unavailable")
+    async with STREAM_REQUEST_SEMAPHORE:
+        stream = STREAM_CLIENT.iter_download(
+            media,
+            offset=offset,
+            limit=1,
+            chunk_size=STREAM_CHUNK_SIZE,
+            request_size=STREAM_CHUNK_SIZE,
+            file_size=file_size,
+        )
+        try:
+            return await stream.__anext__()
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+
+
 async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> web.StreamResponse:
     if STREAM_CLIENT is None or not STREAM_CLIENT.is_connected():
         raise TelegramError("The direct Telegram streaming connection is unavailable")
@@ -537,36 +564,46 @@ async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> 
         return web.Response(status=status, headers=headers)
 
     media = await telegram_media_for_record(record)
-    chunk_size = 512 * 1024
+    chunk_size = STREAM_CHUNK_SIZE
+    first_offset = start - (start % chunk_size)
+    last_offset = end - (end % chunk_size)
+    offsets = list(range(first_offset, last_offset + 1, chunk_size))
     response = web.StreamResponse(status=status, headers=headers)
-    stream = None
+    bytes_sent = 0
+    started_at = time.monotonic()
     async with STREAM_SEMAPHORE:
         try:
-            stream = STREAM_CLIENT.iter_download(
-                media,
-                offset=start,
-                chunk_size=chunk_size,
-                request_size=chunk_size,
-                file_size=size,
-            )
-            first = await stream.__anext__()
-            await response.prepare(request)
-            remaining = length
-            first = first[:remaining]
-            if first:
-                await response.write(first)
-                remaining -= len(first)
-            async for chunk in stream:
-                if remaining <= 0:
-                    break
-                data = chunk[:remaining]
-                if data:
-                    await response.write(data)
-                    remaining -= len(data)
-            if remaining:
-                log.warning("Telegram stream ended %s bytes early for file %s", remaining, record["name"])
+            for batch_start in range(0, len(offsets), STREAM_PIPELINE_CHUNKS):
+                batch_offsets = offsets[batch_start : batch_start + STREAM_PIPELINE_CHUNKS]
+                chunks = await asyncio.gather(
+                    *(telegram_file_chunk(media, offset, size) for offset in batch_offsets),
+                    return_exceptions=True,
+                )
+                for chunk in chunks:
+                    if isinstance(chunk, BaseException):
+                        raise chunk
+                if not response.prepared:
+                    await response.prepare(request)
+                for offset, chunk in zip(batch_offsets, chunks):
+                    left = max(start - offset, 0)
+                    right = min(end + 1 - offset, len(chunk))
+                    data = chunk[left:right]
+                    if data:
+                        await response.write(data)
+                        bytes_sent += len(data)
+            if bytes_sent < length:
+                log.warning("Telegram stream ended %s bytes early for file %s", length - bytes_sent, record["name"])
             await response.write_eof()
             touch_file_cache(record["file_id"])
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            log.info(
+                "Streamed %s/%s bytes for %s in %.2fs (%.2f MB/s)",
+                bytes_sent,
+                length,
+                record["name"],
+                elapsed,
+                bytes_sent / elapsed / 1_000_000,
+            )
             return response
         except Exception:
             if response.prepared:
@@ -574,13 +611,6 @@ async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> 
                 response.force_close()
                 return response
             raise
-        finally:
-            if stream is not None:
-                close = getattr(stream, "close", None)
-                if close is not None:
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
 
 
 async def download(request: web.Request) -> web.StreamResponse:
