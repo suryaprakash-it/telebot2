@@ -3,25 +3,31 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b1020">
-  <title>DropLink · File sharing</title>
+  <meta name="theme-color" content="#090c16">
+  <title>Infinity File Link · File sharing</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <main class="shell landing-shell">
-    <nav class="topbar"><a class="brand" href="/"><span class="brand-mark">↗</span> DROP<span class="brand-light">LINK</span></a><span class="secure"><i></i> FILE SHARING</span></nav>
+    <nav class="topbar">
+      <a class="brand" href="/" aria-label="Infinity File Link home">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M16 16c-2.2-3.5-4.2-5.5-7-5.5a5.5 5.5 0 1 0 0 11c2.8 0 4.8-2 7-5.5Zm0 0c2.2-3.5 4.2-5.5 7-5.5a5.5 5.5 0 1 1 0 11c-2.8 0-4.8-2-7-5.5Z"/></svg></span>
+        <span class="brand-name">INFINITY <span>FILE LINK</span></span>
+      </a>
+      <span class="secure"><i></i> FILE SHARING</span>
+    </nav>
     <section class="hero landing-hero">
       <div class="eyebrow"><span class="eyebrow-dot"></span> BIG FILES, SIMPLE LINKS</div>
-      <h1>Send a file.<br><span>Share it anywhere.</span></h1>
-      <p class="intro">Upload or forward a file to the Telegram bot. Get a clean download link that works in your browser and supports resumable downloads.</p>
+      <h1>Share once.<br><span>Link infinitely.</span></h1>
+      <p class="intro">Infinity File Link turns your Telegram file into a clean, permanent download link for browsers and download managers.</p>
       @@BOT_LINK@@
     </section>
-    <section class="steps">
-      <article><span>01</span><h2>Send your file</h2><p>Message the bot or forward it a file from another chat.</p></article>
-      <article><span>02</span><h2>Get your link</h2><p>Your file is copied to a private Telegram archive and the bot replies with a link.</p></article>
-      <article><span>03</span><h2>Download anywhere</h2><p>Share the link. Browser download managers can resume supported transfers.</p></article>
+    <section class="steps" aria-label="How Infinity File Link works">
+      <article><span class="step-number">01 <i></i></span><h2>Send your file</h2><p>Message the bot or forward a file from another chat.</p></article>
+      <article><span class="step-number">02 <i></i></span><h2>Get your link</h2><p>Your file is saved in your private Telegram archive and a link is ready to share.</p></article>
+      <article><span class="step-number">03 <i></i></span><h2>Download anywhere</h2><p>Open the link in a browser or a download manager with resume support.</p></article>
     </section>
-    <footer><span>Files stay in the archive until its owner removes them</span><span class="footer-lock">🔒 Private links</span></footer>
+    <footer><span class="footer-brand">INFINITY FILE LINK <span>·</span> FILE DELIVERY</span><span class="footer-lock"><span class="lock-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="4.5" y="8.5" width="11" height="8" rx="2"/><path d="M7 8.5V6.4a3 3 0 0 1 6 0v2.1"/></svg></span> Private links</span></footer>
   </main>
 </body>
 </html>

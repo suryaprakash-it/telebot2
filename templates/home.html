@@ -3,23 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b1020">
+  <meta name="theme-color" content="#090c16">
   <meta name="robots" content="noindex,nofollow">
-  <title>{{ name }} · DropLink</title>
+  <title>{{ name }} · Infinity File Link</title>
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="/static/download-state.css">
 </head>
 <body>
   <main class="shell">
     <nav class="topbar">
-      <a class="brand" href="/"><span class="brand-mark">↗</span> DROP<span class="brand-light">LINK</span></a>
-      <span class="secure"><i></i> PRIVATE DOWNLOAD</span>
+      <a class="brand" href="/" aria-label="Infinity File Link home">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M16 16c-2.2-3.5-4.2-5.5-7-5.5a5.5 5.5 0 1 0 0 11c2.8 0 4.8-2 7-5.5Zm0 0c2.2-3.5 4.2-5.5 7-5.5a5.5 5.5 0 1 1 0 11c-2.8 0-4.8-2-7-5.5Z"/></svg></span>
+        <span class="brand-name">INFINITY <span>FILE LINK</span></span>
+      </a>
+      <span class="secure"><i></i> PRIVATE FILE LINK</span>
     </nav>
 
     <section class="hero">
-      <div class="eyebrow"><span class="eyebrow-dot"></span> YOUR FILE IS READY</div>
-      <h1>One file.<br><span>One simple link.</span></h1>
-      <p class="intro">Download directly through your browser. The file is streamed from its Telegram archive as your download begins.</p>
+      <div class="eyebrow"><span class="eyebrow-dot"></span> READY WHEN YOU ARE</div>
+      <h1>Your file,<br><span>ready in one tap.</span></h1>
+      <p class="intro">A clean, permanent download link from Infinity File Link. Open it in your browser or download manager.</p>
     </section>
 
     <section class="file-card" aria-label="File details">
@@ -27,22 +29,22 @@
         <div class="file-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path d="M7 3.75h6.5L19 9.3v10.95H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Z"/><path d="M13 4v5.5h5.5M8.5 14h7M8.5 17h7"/></svg>
         </div>
-        <span class="file-type">{{ kind }}</span>
+        <span class="file-type"><span class="file-type-dot"></span>{{ kind }}</span>
       </div>
       <h2 class="filename">{{ name }}</h2>
-      <div class="file-meta"><span>{{ size }}</span><span class="meta-sep"></span><span>Permanent link</span></div>
+      <div class="file-meta"><span>{{ size }}</span><span class="meta-sep"></span><span>Original file</span><span class="meta-sep"></span><span>Permanent link</span></div>
       <a class="download-button" href="{{ download_url }}" aria-label="Download {{ name }}">
-        <span>Download file</span>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.75v11.5m0 0 4.25-4.25M12 15.25l-4.25-4.25M4.75 16.5v3h14.5v-3"/></svg>
+        <span class="button-copy"><small>SECURE FILE DELIVERY</small><strong>Download file</strong></span>
+        <span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3.75v11.5m0 0 4.25-4.25M12 15.25l-4.25-4.25M4.75 16.5v3h14.5v-3"/></svg></span>
       </a>
       <div class="alt-actions">
-        <span>Browser download · Resume supported</span>
+        <span class="resume-note"><span class="resume-dot"></span>Browser download · Resume supported</span>
         <button type="button" id="copy-link">Copy link</button>
       </div>
       <div class="toast" id="copy-status" role="status" aria-live="polite"></div>
     </section>
 
-    <footer><span>Shared from a private Telegram archive</span><span class="footer-lock">🔒 Link has no expiry</span></footer>
+    <footer><span class="footer-brand">INFINITY FILE LINK <span>·</span> PRIVATE TELEGRAM ARCHIVE</span><span class="footer-lock"><span class="lock-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="4.5" y="8.5" width="11" height="8" rx="2"/><path d="M7 8.5V6.4a3 3 0 0 1 6 0v2.1"/></svg></span> Link has no expiry</span></footer>
   </main>
   <script>
     const copyButton = document.getElementById('copy-link');
