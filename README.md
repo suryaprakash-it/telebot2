@@ -1,4 +1,4 @@
-# Telegram File Link Bot
+# Infinity File Link — Telegram File Sharing Bot
 
 A small self-hosted Telegram bot that copies incoming files into a private Telegram channel and creates a permanent, shareable download page. The page is served by your server and streams Telegram file chunks directly to the browser, with HTTP byte ranges for download managers and resume. It avoids waiting for a full server-side copy before the download can start.
 
@@ -80,6 +80,8 @@ This approach avoids the unresolved `telegram-bot-api` hostname. The Telethon se
 The channel is the durable archive. Back up the SQLite database to preserve generated links across host failures. Local cache copies use disk space and are automatically removed after the configured idle period; the bot can fetch them from Telegram again when a link is opened. Provision enough free disk for files currently being cached. Deleting an archive message or its database row breaks the corresponding link. There is no automatic link expiry.
 
 The app's `/healthz` endpoint reports whether the HTTP service is alive. Keep the bot token, API hash, database, and download links private. Anyone with a bearer link can download its file.
+
+If a browser or download manager closes a range request early, the app records it at INFO level as a browser disconnect. This is expected when a client cancels or replaces a range; it does not mean the Telegram stream itself failed. Per-block Telethon download messages are limited to warnings to keep Render logs readable.
 
 ## API notes
 
