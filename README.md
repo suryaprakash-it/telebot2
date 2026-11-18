@@ -17,7 +17,23 @@ Telegram permits uploads up to 2 GB for regular accounts and 4 GB for Premium ac
 
 The download endpoint does not impose a speed cap. Each browser range stream pipelines up to 4 aligned 512 KiB Telegram requests by default, with a shared cap of 16 active Telegram requests across all streams. This can reduce delay between blocks when a single stream is latency-limited. The service also allows up to 8 simultaneous browser range streams for download managers such as 1DM. These settings can improve use of available bandwidth, but cannot guarantee 10 MB/s: Telegram, the host, the public route, and the recipient must each sustain at least 80 Mbps. Browser range support and request pipelining do not create bandwidth. Stream logs report bytes served and average MB/s, which helps identify whether the deployed route is still limiting throughput.
 
+The download handler also caps active public transfers across both cached and Telegram-backed files. When the cap is full, new transfer requests receive `503 Service Unavailable` with `Retry-After: 1`; clients can retry without creating an unbounded queue of open file streams.
+
 ## Setup
+
+The application and Docker images target Python 3.12. For a local test run,
+install the development requirements and execute the suite from the project
+root:
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+The tests use mocked Telegram clients and temporary SQLite/cache directories;
+they do not need Telegram credentials. To run the app outside Docker, provide
+the required environment variables from `.env.example` and run `python app.py`.
+The configured local Bot API endpoint must be running before polling begins.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and create a **private channel** for the archive. Add the bot as an administrator with permission to post messages. Copy the channel's numeric ID (usually starts with `-100`).
 2. Get a Telegram API ID and hash from [my.telegram.org](https://my.telegram.org/apps). These are used by Telegram's local Bot API server and the direct chunk streaming client.
@@ -67,6 +83,7 @@ This approach avoids the unresolved `telegram-bot-api` hostname. The Telethon se
 | `CACHE_TTL_HOURS` | Hours without a download before a local cache copy is removed; defaults to 24. The Telegram archive and link remain. |
 | `CACHE_CONCURRENCY` | Number of fallback local Bot API cache jobs to run simultaneously; defaults to 1. |
 | `STREAM_CONCURRENCY` | Maximum number of concurrent direct Telegram range streams; defaults to 8. |
+| `DOWNLOAD_CONCURRENCY` | Maximum number of concurrent public file transfers; defaults to 16. Excess downloads receive a retryable 503 response. |
 | `STREAM_PIPELINE_CHUNKS` | Number of aligned 512 KiB Telegram requests pipelined for each browser range stream; defaults to 4. |
 | `STREAM_REQUEST_CONCURRENCY` | Shared maximum number of Telegram file requests in flight across all browser streams; defaults to 16. |
 | `TELETHON_SESSION_PATH` | Path prefix for the persistent Telethon bot session; defaults to a file beside `DATABASE_PATH`. |
@@ -78,6 +95,19 @@ This approach avoids the unresolved `telegram-bot-api` hostname. The Telethon se
 ## Storage and operations
 
 The channel is the durable archive. Back up the SQLite database to preserve generated links across host failures. Local cache copies use disk space and are automatically removed after the configured idle period; the bot can fetch them from Telegram again when a link is opened. Provision enough free disk for files currently being cached. Deleting an archive message or its database row breaks the corresponding link. There is no automatic link expiry.
+
+In Docker Compose, the app and local Bot API share the `telegram-files` volume.
+The app needs that mount writable because its cache-expiry worker removes idle
+files from the shared directory. Both Docker app images check `/healthz`; the
+Render health check follows Render's `PORT` value.
+
+For a database integrity check, stop the app first and preserve a copy of the
+database plus any `-wal` and `-shm` files. Run
+`sqlite3 /path/to/files.sqlite3 'PRAGMA integrity_check;'`. If SQLite reports
+corruption, restore a known-good database backup while the app remains stopped;
+do not remove or recreate the database, since it contains the permanent link
+records. The Telegram archive preserves the file contents but cannot restore
+the original download tokens by itself.
 
 The app's `/healthz` endpoint reports whether the HTTP service is alive. Keep the bot token, API hash, database, and download links private. Anyone with a bearer link can download its file.
 

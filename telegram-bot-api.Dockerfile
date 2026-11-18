@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --recursive https://github.com/tdlib/telegram-bot-api.git /src
 RUN cmake -S /src -B /src/build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build /src/build --target install -j2
+    && cmake --build /src/build --target install -j1
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive

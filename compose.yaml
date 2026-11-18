@@ -24,11 +24,17 @@ services:
     depends_on:
       telegram-bot-api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     ports:
       - "127.0.0.1:${PORT:-8080}:8080"
     volumes:
       - app-data:/app/data
-      - telegram-files:/var/lib/telegram-bot-api:ro
+      - telegram-files:/var/lib/telegram-bot-api
     restart: unless-stopped
 
   caddy:

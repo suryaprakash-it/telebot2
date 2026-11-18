@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --recursive https://github.com/tdlib/telegram-bot-api.git /src
 RUN cmake -S /src -B /src/build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build /src/build --target install -j2
+    && cmake --build /src/build --target install -j1
 
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -27,4 +27,6 @@ COPY run-telegram-bot-api.sh run-render.sh ./
 RUN chmod 0755 /app/run-telegram-bot-api.sh /app/run-render.sh \
     && mkdir -p /var/lib/telegram-bot-api
 EXPOSE 10000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '10000') + '/healthz', timeout=3)"
 CMD ["bash", "/app/run-render.sh"]
