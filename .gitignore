@@ -1,6 +1,9 @@
-.env
+.env*
+!.env.example
+backup/
 data/
 __pycache__/
 *.py[cod]
-*.session
-*.session-journal
+*.session*
+*.sqlite*
+*.db*

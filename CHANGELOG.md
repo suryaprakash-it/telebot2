@@ -2,6 +2,16 @@
 
 ## Unreleased — reliability and verification fixes
 
+- Kept direct Telegram range transfers bounded by the existing per-stream and
+  shared request limits. Batch retries now retain successful chunks and retry
+  only failed offsets; FloodWait retries wait the full reported duration.
+- Filtered Telethon's routine FloodWait INFO messages below WARNING and moved
+  normal browser disconnects to DEBUG; useful stream throughput remains at
+  INFO, and warnings/errors stay visible.
+- Added direct-stream tests for concurrent full downloads, HTTP client
+  cancellation isolation, independent resumable ranges, cache-hit bypass, and
+  exact FloodWait retry timing. Confirmed cached fallback hits avoid Telegram
+  requests; successful direct streams themselves are not written to cache.
 - Consolidated cached downloads into one asynchronous streaming path with
   bounded 1 MiB reads, strong `If-Range` matching, weak `If-None-Match`
   comparison, correct `HEAD` range metadata, empty-file handling, and accurate

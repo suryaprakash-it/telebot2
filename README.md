@@ -17,6 +17,8 @@ Telegram permits uploads up to 2 GB for regular accounts and 4 GB for Premium ac
 
 The download endpoint does not impose a speed cap. Each browser range stream pipelines up to 4 aligned 512 KiB Telegram requests by default, with a shared cap of 16 active Telegram requests across all streams. This can reduce delay between blocks when a single stream is latency-limited. The service also allows up to 8 simultaneous browser range streams for download managers such as 1DM. These settings can improve use of available bandwidth, but cannot guarantee 10 MB/s: Telegram, the host, the public route, and the recipient must each sustain at least 80 Mbps. Browser range support and request pipelining do not create bandwidth. Stream logs report bytes served and average MB/s, which helps identify whether the deployed route is still limiting throughput.
 
+When a local Bot API fallback has already materialized a file, later full or range requests use that cached copy without fetching chunks through Telethon. Successful direct Telethon streams are sent to the requesting browser and are not themselves saved as a complete cache file; a later uncached browser request fetches those Telegram chunks again. Separate browsers and range requests are independent, and overlapping ranges may request the same Telegram chunk.
+
 The download handler also caps active public transfers across both cached and Telegram-backed files. When the cap is full, new transfer requests receive `503 Service Unavailable` with `Retry-After: 1`; clients can retry without creating an unbounded queue of open file streams.
 
 ## Setup
@@ -111,7 +113,7 @@ the original download tokens by itself.
 
 The app's `/healthz` endpoint reports whether the HTTP service is alive. Keep the bot token, API hash, database, and download links private. Anyone with a bearer link can download its file.
 
-If a browser or download manager closes a range request early, the app records it at INFO level as a browser disconnect. This is expected when a client cancels or replaces a range; it does not mean the Telegram stream itself failed. Per-block Telethon download messages are limited to warnings to keep Render logs readable.
+If a browser or download manager closes a range request early, the app records it at DEBUG level as a browser disconnect. This is expected when a client cancels or replaces a range; it does not mean the Telegram stream itself failed. Telethon's routine automatic FloodWait sleep messages are also filtered below WARNING; warnings and errors remain visible.
 
 ## API notes
 

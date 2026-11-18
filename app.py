@@ -27,6 +27,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 log = logging.getLogger("telegram-link-bot")
+# Telethon logs each automatic FloodWait sleep at INFO. Downloads can hit this
+# repeatedly for InvokeWithoutUpdatesRequest; keep warnings/errors visible but
+# avoid flooding deployment logs with routine short waits.
+logging.getLogger("telethon.client.users").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
@@ -633,20 +637,32 @@ async def _fetch_batch_with_retry(
     propagates to subsequent batches in the caller's loop.
     """
     last_exc: BaseException | None = None
+    pending_indices = list(range(len(offsets)))
+    results: list[bytes | None] = [None] * len(offsets)
     for attempt in range(MAX_RETRIES + 1):
         chunks = await asyncio.gather(
-            *(telegram_file_chunk(media_ref[0], offset, file_size) for offset in offsets),
+            *(
+                telegram_file_chunk(media_ref[0], offsets[index], file_size)
+                for index in pending_indices
+            ),
             return_exceptions=True,
         )
-        errors = [(i, c) for i, c in enumerate(chunks) if isinstance(c, BaseException)]
+        errors = []
+        failed_indices = []
+        for index, chunk in zip(pending_indices, chunks):
+            if isinstance(chunk, BaseException):
+                errors.append((index, chunk))
+                failed_indices.append(index)
+            else:
+                results[index] = chunk
         if not errors:
-            return chunks  # type: ignore[return-value]
+            return [chunk for chunk in results if chunk is not None]
 
         last_exc = errors[0][1]
         if attempt >= MAX_RETRIES:
             break
 
-        # --- file reference expired → refresh and retry the whole batch ---
+        # --- expired reference → refresh and retry only failed offsets ---
         ref_errors = [e for _, e in errors if _is_file_reference_error(e)]
         if ref_errors:
             log.warning(
@@ -659,6 +675,7 @@ async def _fetch_batch_with_retry(
             except Exception as refresh_exc:
                 log.error("Reference refresh failed: %s", refresh_exc)
                 raise ref_errors[0] from refresh_exc
+            pending_indices = failed_indices
             continue
 
         # --- flood wait → sleep the requested duration, then retry ---
@@ -666,7 +683,9 @@ async def _fetch_batch_with_retry(
             _get_flood_wait_seconds(e) for _, e in errors if _get_flood_wait_seconds(e) is not None
         ]
         if flood_waits:
-            wait = min(max(flood_waits), 30)
+            # FloodWait.seconds is Telegram's required delay. Never cap it and
+            # retry early; that would turn a transient wait into a retry loop.
+            wait = max(flood_waits)
             log.warning(
                 "Telegram flood wait %ds (attempt %d/%d)",
                 wait,
@@ -674,6 +693,7 @@ async def _fetch_batch_with_retry(
                 MAX_RETRIES,
             )
             await asyncio.sleep(wait)
+            pending_indices = failed_indices
             continue
 
         # --- other retryable errors → exponential backoff ---
@@ -688,6 +708,7 @@ async def _fetch_batch_with_retry(
                 retryable[0],
             )
             await asyncio.sleep(delay)
+            pending_indices = failed_indices
             continue
 
         # non-retryable error — stop immediately
@@ -831,7 +852,7 @@ async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> 
             return response
         except (ConnectionResetError, ConnectionError):
             if response.prepared:
-                log.info(
+                log.debug(
                     "Client disconnected during download of %s after %s bytes",
                     record["name"],
                     bytes_sent,
@@ -979,7 +1000,7 @@ async def _serve_cached_file(
             await response.write_eof()
         await touch_file_cache(record["file_id"])
     except (ConnectionResetError, ConnectionError):
-        log.info("Client disconnected during cached download of %s", record["name"])
+        log.debug("Client disconnected during cached download of %s", record["name"])
         response.force_close()
     except OSError:
         if response.prepared:
