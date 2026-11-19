@@ -2,6 +2,8 @@
 
 ## Unreleased — reliability and verification fixes
 
+- Replaced serial Telegram update handling with a durable SQLite inbox and bounded concurrent workers. Polling now persists each update before advancing the Bot API offset; slow `copyMessage`/`sendMessage` operations no longer block receipt of the next file. Pending work is retried and in-progress work is recovered after restart. Added per-request Bot API timeouts without changing the long-lived HTTP session timeout used by file streaming.
+
 - Kept direct Telegram range transfers bounded by the existing per-stream and
   shared request limits. Batch retries now retain successful chunks and retry
   only failed offsets; FloodWait retries wait the full reported duration.

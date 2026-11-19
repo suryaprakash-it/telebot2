@@ -84,6 +84,7 @@ This approach avoids the unresolved `telegram-bot-api` hostname. The Telethon se
 | `ALLOWED_TELEGRAM_USER_IDS` | Optional comma-separated IDs. Empty allows any Telegram user to upload. |
 | `MAX_FILE_BYTES` | Maximum accepted size; defaults to 4 GiB. |
 | `CACHE_TTL_HOURS` | Hours without a download before a local cache copy is removed; defaults to 24. The Telegram archive and link remain. |
+| `BOT_UPDATE_WORKERS` | Number of durable Telegram message handlers running concurrently; defaults to 3 (maximum 8). Updates are saved to SQLite before Telegram polling advances, and unfinished work is recovered after restart. |
 | `CACHE_CONCURRENCY` | Number of fallback local Bot API cache jobs to run simultaneously; defaults to 1 (maximum 4). |
 | `STREAM_CONCURRENCY` | Maximum number of concurrent direct Telegram range streams; defaults to 3 (maximum 16). |
 | `DOWNLOAD_CONCURRENCY` | Maximum number of concurrent public file transfers; defaults to 10 (maximum 64). Excess global transfers receive a retryable 503 response. |

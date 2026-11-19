@@ -5,6 +5,7 @@ import contextvars
 import hashlib
 import aiofiles
 import html
+import json
 import logging
 import mimetypes
 import os
@@ -64,6 +65,7 @@ def bounded_int_env(name: str, default: int, maximum: int) -> int:
 
 
 CACHE_CONCURRENCY = bounded_int_env("CACHE_CONCURRENCY", 1, 4)
+BOT_UPDATE_WORKERS = bounded_int_env("BOT_UPDATE_WORKERS", 3, 8)
 STREAM_CONCURRENCY = bounded_int_env("STREAM_CONCURRENCY", 3, 16)
 DOWNLOAD_CONCURRENCY = bounded_int_env("DOWNLOAD_CONCURRENCY", 10, 64)
 _per_file_download_limit = bounded_int_env("PER_FILE_DOWNLOAD_CONCURRENCY", 5, 32)
@@ -297,6 +299,20 @@ async def db_init() -> None:
     await DB.execute(
         "CREATE TABLE IF NOT EXISTS processed_updates (update_id INTEGER PRIMARY KEY, processed_at INTEGER NOT NULL)"
     )
+    # Durable inbox: receipt is persisted before advancing Telegram's polling offset.
+    # Pending work therefore survives restarts and can be processed concurrently.
+    await DB.execute(
+        "CREATE TABLE IF NOT EXISTS update_inbox ("
+        "update_id INTEGER PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', "
+        "attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, "
+        "last_error TEXT)"
+    )
+    await DB.execute(
+        "CREATE INDEX IF NOT EXISTS update_inbox_status_created "
+        "ON update_inbox(status, created_at, update_id)"
+    )
+    # A process may have stopped while a worker owned an item. Make it recoverable.
+    await DB.execute("UPDATE update_inbox SET status='pending', updated_at=? WHERE status='processing'", (int(time.time()),))
     await DB.commit()
 
 
@@ -327,20 +343,26 @@ async def save_offset(offset: int) -> None:
         await DB.commit()
 
 
-async def commit_update(update_id: int) -> int:
-    """Persist update receipt and next polling offset atomically."""
+async def enqueue_update(update: dict[str, Any]) -> int:
+    """Durably enqueue an update and advance the Bot API offset atomically."""
     assert DB is not None
+    update_id = int(update["update_id"])
     next_offset = update_id + 1
+    now = int(time.time())
+    payload = json.dumps(update, separators=(",", ":"), ensure_ascii=False)
     async with database_lock():
         await DB.execute("BEGIN IMMEDIATE")
         try:
             await DB.execute(
-                "INSERT OR IGNORE INTO processed_updates(update_id, processed_at) VALUES (?, ?)",
-                (update_id, int(time.time())),
+                "INSERT OR IGNORE INTO update_inbox(update_id,payload,status,attempts,created_at,updated_at) "
+                "VALUES(?,?,'pending',0,?,?)",
+                (update_id, payload, now, now),
             )
             await DB.execute(
                 "INSERT INTO bot_state(key, value) VALUES('update_offset', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                "ON CONFLICT(key) DO UPDATE SET value = "
+                "CASE WHEN CAST(bot_state.value AS INTEGER) < CAST(excluded.value AS INTEGER) "
+                "THEN excluded.value ELSE bot_state.value END",
                 (str(next_offset),),
             )
             await DB.commit()
@@ -348,6 +370,60 @@ async def commit_update(update_id: int) -> int:
             await DB.rollback()
             raise
     return next_offset
+
+
+async def claim_next_update() -> tuple[int, dict[str, Any]] | None:
+    """Atomically claim the oldest pending update for one worker."""
+    assert DB is not None
+    async with database_lock():
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            async with DB.execute(
+                "SELECT update_id,payload FROM update_inbox WHERE status='pending' "
+                "ORDER BY update_id LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                await DB.commit()
+                return None
+            update_id = int(row["update_id"])
+            await DB.execute(
+                "UPDATE update_inbox SET status='processing', attempts=attempts+1, updated_at=? "
+                "WHERE update_id=? AND status='pending'",
+                (int(time.time()), update_id),
+            )
+            await DB.commit()
+            return update_id, json.loads(row["payload"])
+        except BaseException:
+            await DB.rollback()
+            raise
+
+
+async def finish_update(update_id: int) -> None:
+    assert DB is not None
+    async with database_lock():
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            await DB.execute(
+                "INSERT OR IGNORE INTO processed_updates(update_id,processed_at) VALUES(?,?)",
+                (update_id, int(time.time())),
+            )
+            await DB.execute("DELETE FROM update_inbox WHERE update_id=?", (update_id,))
+            await DB.commit()
+        except BaseException:
+            await DB.rollback()
+            raise
+
+
+async def retry_update(update_id: int, exc: BaseException) -> None:
+    assert DB is not None
+    # Store only the exception type: error strings can contain user data or URLs.
+    async with database_lock():
+        await DB.execute(
+            "UPDATE update_inbox SET status='pending', updated_at=?, last_error=? WHERE update_id=?",
+            (int(time.time()), type(exc).__name__, update_id),
+        )
+        await DB.commit()
 
 
 async def update_was_processed(update_id: int) -> bool:
@@ -575,7 +651,12 @@ async def telegram(method: str, payload: dict[str, Any] | None = None) -> Any:
         raise RuntimeError("HTTP session is not ready")
     url = f"{BOT_API_BASE_URL}/bot{BOT_TOKEN}/{method}"
     try:
-        async with HTTP.post(url, json=payload or {}) as response:
+        request_timeout = ClientTimeout(
+            total=40 if method == "getUpdates" else 60,
+            connect=15,
+            sock_read=40 if method == "getUpdates" else 60,
+        )
+        async with HTTP.post(url, json=payload or {}, timeout=request_timeout) as response:
             data = await response.json(content_type=None)
             if response.status >= 400 or not data.get("ok"):
                 description = data.get("description", f"HTTP {response.status}")
@@ -1506,7 +1587,31 @@ async def on_message(message: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # Update polling
 # ---------------------------------------------------------------------------
+async def update_worker(worker_number: int) -> None:
+    """Process durable inbox entries independently of Telegram polling."""
+    while True:
+        item = await claim_next_update()
+        if item is None:
+            await asyncio.sleep(0.2)
+            continue
+        update_id, update = item
+        try:
+            message = update.get("message")
+            if message:
+                await on_message(message)
+            await finish_update(update_id)
+            diagnostic_event(logging.INFO, "bot_update.processed", update_id=update_id, worker=worker_number)
+        except asyncio.CancelledError:
+            # db_init() resets any abandoned processing row after a restart.
+            raise
+        except Exception as exc:
+            log.exception("Bot update %s failed in worker %s; it will be retried", update_id, worker_number)
+            await retry_update(update_id, exc)
+            await asyncio.sleep(min(10, 0.5 * (2 ** min(4, 1))))
+
+
 async def poll_updates() -> None:
+    """Receive updates quickly; durable inbox workers handle slow Bot API actions."""
     global OFFSET
     while True:
         try:
@@ -1518,30 +1623,12 @@ async def poll_updates() -> None:
                 update_id = int(update["update_id"])
                 if update_id < OFFSET:
                     continue
-                message = update.get("message")
-                try:
-                    if not await update_was_processed(update_id) and message:
-                        await on_message(message)
-                    # Processing receipts and offsets share one transaction.
-                    # Keep the in-memory offset unchanged if SQLite fails so
-                    # Telegram is polled again from the last durable position.
-                    new_offset = await commit_update(update_id)
-                    OFFSET = max(OFFSET, new_offset)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception(
-                        "Failed to process or persist Telegram update %s; "
-                        "leaving offset at %s for retry",
-                        update_id,
-                        OFFSET,
-                    )
-                    await asyncio.sleep(1)
-                    break
+                new_offset = await enqueue_update(update)
+                OFFSET = max(OFFSET, new_offset)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Telegram polling failed; retrying shortly")
+            log.exception("Telegram polling or durable enqueue failed; retrying shortly")
             await asyncio.sleep(3)
 
 
@@ -1589,6 +1676,7 @@ async def start_app() -> None:
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     cleanup_task: asyncio.Task[None] | None = None
+    worker_tasks: list[asyncio.Task[None]] = []
     try:
         HTTP = ClientSession(timeout=timeout)
         site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -1623,8 +1711,16 @@ async def start_app() -> None:
                 await STREAM_CLIENT.disconnect()
                 STREAM_CLIENT = None
         cleanup_task = asyncio.create_task(cache_cleanup_loop(), name="file-cache-cleanup")
+        worker_tasks = [
+            asyncio.create_task(update_worker(index + 1), name=f"bot-update-worker-{index + 1}")
+            for index in range(BOT_UPDATE_WORKERS)
+        ]
         await poll_updates()
     finally:
+        for worker_task in worker_tasks:
+            worker_task.cancel()
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
         if cleanup_task is not None:
             cleanup_task.cancel()
             await asyncio.gather(cleanup_task, return_exceptions=True)
