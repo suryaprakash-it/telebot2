@@ -376,18 +376,56 @@ class TestTelegramAPIErrors:
 # Update polling tests
 # ═══════════════════════════════════════════════════════════════════════════════
 class TestPollUpdates:
-    """poll_updates offset persistence and error handling."""
+    """Durable update intake and worker queue behavior."""
 
     @pytest.mark.asyncio
-    async def test_offset_not_advanced_on_failure(self, db):
-        """Regression: failed update processing must NOT advance the saved offset.
+    async def test_enqueue_persists_payload_and_advances_offset(self, db):
+        app_module.OFFSET = 0
+        update = {"update_id": 100, "message": {"chat": {"id": 1}, "text": "hello"}}
 
-        The original code advanced OFFSET even after on_message() raised,
-        permanently skipping the failed update.
-        """
+        assert await app_module.enqueue_update(update) == 101
+        assert await app_module.load_offset() == 101
+        claimed = await app_module.claim_next_update()
+        assert claimed == (100, update)
+
+    @pytest.mark.asyncio
+    async def test_enqueue_is_idempotent_for_duplicate_update_ids(self, db):
+        update = {"update_id": 100, "message": {"text": "first"}}
+        await app_module.enqueue_update(update)
+        await app_module.enqueue_update({"update_id": 100, "message": {"text": "duplicate"}})
+
+        claimed = await app_module.claim_next_update()
+        assert claimed == (100, update)
+        assert await app_module.claim_next_update() is None
+
+    @pytest.mark.asyncio
+    async def test_failed_worker_item_can_be_retried(self, db):
+        update = {"update_id": 101, "message": {"text": "retry me"}}
+        await app_module.enqueue_update(update)
+        claimed = await app_module.claim_next_update()
+        assert claimed == (101, update)
+
+        await app_module.retry_update(101, RuntimeError("private detail must not be stored"))
+        claimed_again = await app_module.claim_next_update()
+        assert claimed_again == (101, update)
+        async with db.execute("SELECT attempts,last_error FROM update_inbox WHERE update_id=101") as cursor:
+            row = await cursor.fetchone()
+        assert row["attempts"] == 2
+        assert row["last_error"] == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_finish_marks_update_processed_and_removes_inbox_item(self, db):
+        await app_module.enqueue_update({"update_id": 102, "message": {"text": "done"}})
+        await app_module.claim_next_update()
+        await app_module.finish_update(102)
+
+        assert await app_module.update_was_processed(102)
+        assert await app_module.claim_next_update() is None
+
+    @pytest.mark.asyncio
+    async def test_polling_does_not_wait_for_message_handler(self, db):
         app_module.OFFSET = 0
         await app_module.save_offset(0)
-
         call_count = 0
 
         async def mock_telegram(method, payload=None):
@@ -395,149 +433,19 @@ class TestPollUpdates:
             if method == "getUpdates":
                 call_count += 1
                 if call_count == 1:
-                    return [
-                        {"update_id": 100, "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "test"}},
-                    ]
-                raise asyncio.CancelledError()  # stop the loop on 2nd call
-            return None
-
-        with patch.object(app_module, "telegram", side_effect=mock_telegram):
-            with patch.object(app_module, "on_message", new_callable=AsyncMock) as mock_on_msg:
-                mock_on_msg.side_effect = RuntimeError("Processing failed!")
-                with pytest.raises(asyncio.CancelledError):
-                    await app_module.poll_updates()
-
-        # Offset should NOT have advanced past the failed update
-        assert app_module.OFFSET == 0
-        saved = await app_module.load_offset()
-        assert saved == 0
-
-    @pytest.mark.asyncio
-    async def test_offset_advanced_on_success(self, db):
-        """Successful processing advances the offset."""
-        app_module.OFFSET = 0
-        await app_module.save_offset(0)
-
-        call_count = 0
-
-        async def mock_telegram(method, payload=None):
-            nonlocal call_count
-            if method == "getUpdates":
-                call_count += 1
-                if call_count == 1:
-                    return [
-                        {"update_id": 100, "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "test"}},
-                    ]
+                    return [{"update_id": 103, "message": {"text": "slow handler"}}]
                 raise asyncio.CancelledError()
             return None
 
         with patch.object(app_module, "telegram", side_effect=mock_telegram):
-            with patch.object(app_module, "on_message", new_callable=AsyncMock):
-                with pytest.raises(asyncio.CancelledError):
-                    await app_module.poll_updates()
+            with pytest.raises(asyncio.CancelledError):
+                await app_module.poll_updates()
 
-        assert app_module.OFFSET == 101
-        saved = await app_module.load_offset()
-        assert saved == 101
-
-    @pytest.mark.asyncio
-    async def test_duplicate_updates_handled_safely(self, db):
-        """Processing the same update_id twice should not cause errors."""
-        app_module.OFFSET = 0
-        await app_module.save_offset(0)
-
-        call_count = 0
-
-        async def mock_telegram(method, payload=None):
-            nonlocal call_count
-            if method == "getUpdates":
-                call_count += 1
-                if call_count <= 2:
-                    return [
-                        {"update_id": 100, "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "test"}},
-                    ]
-                raise asyncio.CancelledError()
-            return None
-
-        process_count = 0
-
-        async def counting_on_message(msg):
-            nonlocal process_count
-            process_count += 1
-
-        with patch.object(app_module, "telegram", side_effect=mock_telegram):
-            with patch.object(app_module, "on_message", side_effect=counting_on_message):
-                with pytest.raises(asyncio.CancelledError):
-                    await app_module.poll_updates()
-
-        # Update 100 is processed successfully the first time, offset advances to 101.
-        # On the second getUpdates call, the server returns update_id=100 again
-        # (simulating duplicate), but since OFFSET is now 101 and in reality the
-        # server wouldn't return it, we just verify no crash.
-        assert app_module.OFFSET == 101
-
-    @pytest.mark.asyncio
-    async def test_telegram_polling_failure_retries(self, db):
-        """Telegram API failures should not crash the loop."""
-        app_module.OFFSET = 0
-
-        call_count = 0
-
-        async def mock_telegram(method, payload=None):
-            nonlocal call_count
-            if method == "getUpdates":
-                call_count += 1
-                if call_count == 1:
-                    raise app_module.TelegramError("Temporary API failure")
-                if call_count == 2:
-                    raise asyncio.CancelledError()
-            return None
-
-        with patch.object(app_module, "telegram", side_effect=mock_telegram):
-            with patch("asyncio.sleep", new_callable=AsyncMock):
-                with pytest.raises(asyncio.CancelledError):
-                    await app_module.poll_updates()
-
-        assert call_count == 2  # First failed, second cancelled
-
-    @pytest.mark.asyncio
-    async def test_failed_offset_commit_retries_without_acknowledging(self, db):
-        app_module.OFFSET = 0
-        await app_module.save_offset(0)
-        response_count = 0
-        offsets = []
-
-        async def mock_telegram(method, payload=None):
-            nonlocal response_count
-            if method != "getUpdates":
-                return None
-            offsets.append(payload["offset"])
-            response_count += 1
-            if response_count <= 2:
-                return [{"update_id": 70, "message": {"text": "retry"}}]
-            raise asyncio.CancelledError()
-
-        original_commit = app_module.commit_update
-        attempts = 0
-
-        async def fail_once(update_id):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise OSError("temporary sqlite failure")
-            return await original_commit(update_id)
-
-        with patch.object(app_module, "telegram", side_effect=mock_telegram):
-            with patch.object(app_module, "on_message", new_callable=AsyncMock) as handler:
-                with patch.object(app_module, "commit_update", side_effect=fail_once):
-                    with patch("asyncio.sleep", new_callable=AsyncMock):
-                        with pytest.raises(asyncio.CancelledError):
-                            await app_module.poll_updates()
-
-        assert handler.await_count == 2
-        assert offsets[:2] == [0, 0]
-        assert app_module.OFFSET == 71
-        assert await app_module.load_offset() == 71
+        assert app_module.OFFSET == 104
+        assert await app_module.load_offset() == 104
+        # The update is durably queued; poll_updates never calls on_message.
+        claimed = await app_module.claim_next_update()
+        assert claimed == (103, {"update_id": 103, "message": {"text": "slow handler"}})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
