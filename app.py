@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import aiofiles
 import html
@@ -11,6 +12,7 @@ import re
 import secrets
 import signal
 import time
+import uuid
 import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -46,11 +48,35 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/app/data/files.sqlite3"))
 BOT_API_DATA_DIR = Path(os.getenv("BOT_API_DATA_DIR", "/var/lib/telegram-bot-api")).resolve()
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(4 * 1024**3)))
 CACHE_TTL_SECONDS = max(1, int(os.getenv("CACHE_TTL_HOURS", "24"))) * 60 * 60
-CACHE_CONCURRENCY = max(1, int(os.getenv("CACHE_CONCURRENCY", "1")))
-STREAM_CONCURRENCY = max(1, int(os.getenv("STREAM_CONCURRENCY", "8")))
-DOWNLOAD_CONCURRENCY = max(1, int(os.getenv("DOWNLOAD_CONCURRENCY", "16")))
-STREAM_PIPELINE_CHUNKS = max(1, int(os.getenv("STREAM_PIPELINE_CHUNKS", "4")))
-STREAM_REQUEST_CONCURRENCY = max(1, int(os.getenv("STREAM_REQUEST_CONCURRENCY", "16")))
+
+
+def bounded_int_env(name: str, default: int, maximum: int) -> int:
+    """Read a positive concurrency limit and cap it to a safe upper bound."""
+    try:
+        configured = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if configured < 1:
+        raise RuntimeError(f"{name} must be a positive integer")
+    if configured > maximum:
+        log.warning("Capping %s=%d to the supported maximum of %d", name, configured, maximum)
+    return min(configured, maximum)
+
+
+CACHE_CONCURRENCY = bounded_int_env("CACHE_CONCURRENCY", 1, 4)
+STREAM_CONCURRENCY = bounded_int_env("STREAM_CONCURRENCY", 3, 16)
+DOWNLOAD_CONCURRENCY = bounded_int_env("DOWNLOAD_CONCURRENCY", 10, 64)
+_per_file_download_limit = bounded_int_env("PER_FILE_DOWNLOAD_CONCURRENCY", 5, 32)
+_fair_per_file_limit = max(1, DOWNLOAD_CONCURRENCY // 2)
+if _per_file_download_limit > _fair_per_file_limit:
+    log.warning(
+        "Capping PER_FILE_DOWNLOAD_CONCURRENCY=%d to %d (half the global transfer limit)",
+        _per_file_download_limit,
+        _fair_per_file_limit,
+    )
+PER_FILE_DOWNLOAD_CONCURRENCY = min(_per_file_download_limit, _fair_per_file_limit)
+STREAM_PIPELINE_CHUNKS = bounded_int_env("STREAM_PIPELINE_CHUNKS", 4, 8)
+STREAM_REQUEST_CONCURRENCY = bounded_int_env("STREAM_REQUEST_CONCURRENCY", 8, 32)
 STREAM_CHUNK_SIZE = 512 * 1024
 MAX_RETRIES = max(0, int(os.getenv("MAX_RETRIES", "3")))
 RETRY_BASE_DELAY = max(0.1, float(os.getenv("RETRY_BASE_DELAY", "0.5")))
@@ -83,9 +109,16 @@ ACTIVE_CACHE_STREAMS: dict[str, int] = {}
 CACHE_STREAM_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
 DATABASE_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
 DOWNLOAD_SEMAPHORES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
-CACHE_SEMAPHORE = asyncio.Semaphore(CACHE_CONCURRENCY)
-STREAM_SEMAPHORE = asyncio.Semaphore(STREAM_CONCURRENCY)
-STREAM_REQUEST_SEMAPHORE = asyncio.Semaphore(STREAM_REQUEST_CONCURRENCY)
+CACHE_SEMAPHORES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+STREAM_SEMAPHORES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+STREAM_REQUEST_SEMAPHORES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+ACTIVE_DOWNLOADS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, int] = weakref.WeakKeyDictionary()
+ACTIVE_FILE_DOWNLOADS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, int]] = weakref.WeakKeyDictionary()
+ACTIVE_STREAMS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, int] = weakref.WeakKeyDictionary()
+ACTIVE_TELEGRAM_REQUESTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, int] = weakref.WeakKeyDictionary()
+ACTIVE_CACHE_JOBS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, int] = weakref.WeakKeyDictionary()
+REQUEST_ID: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+FILE_TOKEN_ID: contextvars.ContextVar[str] = contextvars.ContextVar("file_token_id", default="-")
 TEMPLATE_LANDING: str = ""
 TEMPLATE_HOME: str = ""
 
@@ -118,6 +151,103 @@ def download_semaphore() -> asyncio.Semaphore:
         semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
         DOWNLOAD_SEMAPHORES[loop] = semaphore
     return semaphore
+
+
+def loop_semaphore(
+    registry: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore],
+    capacity: int,
+) -> asyncio.Semaphore:
+    """Return a semaphore owned by the current loop, never a stale loop."""
+    loop = asyncio.get_running_loop()
+    semaphore = registry.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(capacity)
+        registry[loop] = semaphore
+    return semaphore
+
+
+def cache_semaphore() -> asyncio.Semaphore:
+    return loop_semaphore(CACHE_SEMAPHORES, CACHE_CONCURRENCY)
+
+
+def stream_semaphore() -> asyncio.Semaphore:
+    return loop_semaphore(STREAM_SEMAPHORES, STREAM_CONCURRENCY)
+
+
+def stream_request_semaphore() -> asyncio.Semaphore:
+    return loop_semaphore(STREAM_REQUEST_SEMAPHORES, STREAM_REQUEST_CONCURRENCY)
+
+
+def active_count(registry: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, int]) -> int:
+    return registry.get(asyncio.get_running_loop(), 0)
+
+
+def diagnostic_event(level: int, event: str, **fields: Any) -> None:
+    """Emit bounded, secret-safe key/value diagnostics for one request."""
+    loop = asyncio.get_running_loop()
+    semaphore = DOWNLOAD_SEMAPHORES.get(loop)
+    available = max(0, DOWNLOAD_CONCURRENCY - active_count(ACTIVE_DOWNLOADS))
+    if semaphore is not None:
+        available = max(0, semaphore._value)
+    details = {
+        "request_id": REQUEST_ID.get(),
+        "file_token_id": FILE_TOKEN_ID.get(),
+        "active_downloads": active_count(ACTIVE_DOWNLOADS),
+        "download_capacity": DOWNLOAD_CONCURRENCY,
+        "download_available": available,
+        "active_telegram_requests": active_count(ACTIVE_TELEGRAM_REQUESTS),
+        "telegram_request_capacity": STREAM_REQUEST_CONCURRENCY,
+        "telegram_request_available": max(
+            0,
+            STREAM_REQUEST_CONCURRENCY - active_count(ACTIVE_TELEGRAM_REQUESTS),
+        ),
+    }
+    details.update(fields)
+    suffix = " ".join(f"{key}={value!s}" for key, value in details.items())
+    log.log(level, "%s %s", event, suffix)
+
+
+@asynccontextmanager
+async def tracked_semaphore(
+    semaphore: asyncio.Semaphore,
+    active_registry: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, int],
+    resource: str,
+):
+    """Acquire/release a per-loop resource and record wait/cancel diagnostics."""
+    loop = asyncio.get_running_loop()
+    waited_at = time.monotonic()
+    acquired = False
+    try:
+        await semaphore.acquire()
+        acquired = True
+        active_registry[loop] = active_registry.get(loop, 0) + 1
+        diagnostic_event(
+            logging.DEBUG,
+            f"{resource}.permit_acquired",
+            resource_wait_ms=round((time.monotonic() - waited_at) * 1000, 1),
+            active_resource=active_count(active_registry),
+            resource_available=max(0, semaphore._value),
+        )
+        try:
+            yield
+        finally:
+            active_registry[loop] = max(0, active_registry.get(loop, 1) - 1)
+            semaphore.release()
+            diagnostic_event(
+                logging.DEBUG,
+                f"{resource}.permit_released",
+                active_resource=active_count(active_registry),
+                resource_available=max(0, semaphore._value),
+            )
+    except asyncio.CancelledError:
+        if not acquired:
+            diagnostic_event(
+                logging.INFO,
+                f"{resource}.cancelled_waiting",
+                cancellation_reason=f"cancelled_while_waiting_for_{resource}_slot",
+                resource_wait_ms=round((time.monotonic() - waited_at) * 1000, 1),
+            )
+        raise
 
 
 async def db_init() -> None:
@@ -495,7 +625,13 @@ def media_info(message: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
 # ---------------------------------------------------------------------------
 async def materialize_file(file_id: str) -> Path:
     try:
-        async with CACHE_SEMAPHORE:
+        async with tracked_semaphore(cache_semaphore(), ACTIVE_CACHE_JOBS, "cache"):
+            diagnostic_event(
+                logging.DEBUG,
+                "cache.request.start",
+                active_cache_jobs=active_count(ACTIVE_CACHE_JOBS),
+                cache_capacity=CACHE_CONCURRENCY,
+            )
             result = await telegram("getFile", {"file_id": file_id})
         file_path = result.get("file_path") if result else None
         if not file_path:
@@ -542,7 +678,9 @@ async def cached_file(record: dict[str, Any]) -> Path:
                 return resolved
         except OSError:
             pass
-    return await start_materialize(record["file_id"])
+    # Multiple requests for the same file share one bounded cache task. A
+    # disconnected browser must not propagate cancellation into that shared job.
+    return await asyncio.shield(start_materialize(record["file_id"]))
 
 
 def user_allowed(user_id: int) -> bool:
@@ -557,10 +695,14 @@ async def telegram_media_for_record(record: dict[str, Any]) -> Any:
     if STREAM_CLIENT is None:
         raise TelegramError("The direct Telegram streaming connection is unavailable")
     try:
-        message = await STREAM_CLIENT.get_messages(
-            int(record["archive_chat_id"]),
-            ids=int(record["archive_message_id"]),
-        )
+        async with tracked_semaphore(
+            stream_request_semaphore(), ACTIVE_TELEGRAM_REQUESTS, "telegram_request"
+        ):
+            diagnostic_event(logging.DEBUG, "telegram_request.media_lookup.start")
+            message = await STREAM_CLIENT.get_messages(
+                int(record["archive_chat_id"]),
+                ids=int(record["archive_message_id"]),
+            )
         if message is not None and message.media is not None:
             return message
     except Exception as exc:
@@ -581,10 +723,14 @@ async def refresh_media_reference(record: dict[str, Any]) -> Any:
     if STREAM_CLIENT is None:
         raise TelegramError("Stream client unavailable for reference refresh")
     try:
-        message = await STREAM_CLIENT.get_messages(
-            int(record["archive_chat_id"]),
-            ids=int(record["archive_message_id"]),
-        )
+        async with tracked_semaphore(
+            stream_request_semaphore(), ACTIVE_TELEGRAM_REQUESTS, "telegram_request"
+        ):
+            diagnostic_event(logging.DEBUG, "telegram_request.reference_refresh.start")
+            message = await STREAM_CLIENT.get_messages(
+                int(record["archive_chat_id"]),
+                ids=int(record["archive_message_id"]),
+            )
         if message is not None and message.media is not None:
             log.info(
                 "Refreshed file reference for archive message %d",
@@ -606,19 +752,41 @@ async def telegram_file_chunk(media: Any, offset: int, file_size: int) -> bytes:
     """Fetch one Telegram-aligned block while sharing a bounded request pool."""
     if STREAM_CLIENT is None:
         raise TelegramError("The direct Telegram streaming connection is unavailable")
-    async with STREAM_REQUEST_SEMAPHORE:
-        stream = STREAM_CLIENT.iter_download(
-            media,
-            offset=offset,
-            limit=1,
-            chunk_size=STREAM_CHUNK_SIZE,
-            request_size=STREAM_CHUNK_SIZE,
-            file_size=file_size,
-        )
+    async with tracked_semaphore(
+        stream_request_semaphore(), ACTIVE_TELEGRAM_REQUESTS, "telegram_request"
+    ):
+        stream = None
+        diagnostic_event(logging.DEBUG, "telegram_request.start", offset=offset)
         try:
-            return await stream.__anext__()
+            stream = STREAM_CLIENT.iter_download(
+                media,
+                offset=offset,
+                limit=1,
+                chunk_size=STREAM_CHUNK_SIZE,
+                request_size=STREAM_CHUNK_SIZE,
+                file_size=file_size,
+            )
+            chunk = await stream.__anext__()
+            diagnostic_event(logging.DEBUG, "telegram_request.complete", offset=offset)
+            return chunk
+        except asyncio.CancelledError:
+            diagnostic_event(
+                logging.INFO,
+                "telegram_request.cancelled",
+                offset=offset,
+                cancellation_reason="request_cancelled_or_shutdown",
+            )
+            raise
+        except Exception as exc:
+            diagnostic_event(
+                logging.WARNING,
+                "telegram_request.failed",
+                offset=offset,
+                exception_type=type(exc).__name__,
+            )
+            raise
         finally:
-            close = getattr(stream, "close", None)
+            close = getattr(stream, "close", None) if stream is not None else None
             if close is not None:
                 result = close()
                 if asyncio.iscoroutine(result):
@@ -811,11 +979,20 @@ async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> 
     chunk_size = STREAM_CHUNK_SIZE
     first_offset = start - (start % chunk_size)
     last_offset = end - (end % chunk_size)
-    offsets = list(range(first_offset, last_offset + 1, chunk_size))
+    offsets = range(first_offset, last_offset + 1, chunk_size)
     response = web.StreamResponse(status=status, headers=headers)
     bytes_sent = 0
     started_at = time.monotonic()
-    async with STREAM_SEMAPHORE:
+    semaphore = stream_semaphore()
+    async with tracked_semaphore(semaphore, ACTIVE_STREAMS, "stream"):
+        diagnostic_event(
+            logging.INFO,
+            "stream.start",
+            active_streams=active_count(ACTIVE_STREAMS),
+            stream_capacity=STREAM_CONCURRENCY,
+            range_start=start,
+            range_end=end,
+        )
         try:
             for batch_start in range(0, len(offsets), STREAM_PIPELINE_CHUNKS):
                 batch_offsets = offsets[batch_start : batch_start + STREAM_PIPELINE_CHUNKS]
@@ -841,6 +1018,13 @@ async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> 
             await response.write_eof()
             await touch_file_cache(record["file_id"])
             elapsed = max(time.monotonic() - started_at, 0.001)
+            diagnostic_event(
+                logging.INFO,
+                "stream.complete",
+                bytes_sent=bytes_sent,
+                range_length=length,
+                elapsed_seconds=round(elapsed, 3),
+            )
             log.info(
                 "Streamed %s/%s bytes for %s in %.2fs (%.2f MB/s)",
                 bytes_sent,
@@ -850,8 +1034,24 @@ async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> 
                 bytes_sent / elapsed / 1_000_000,
             )
             return response
+        except asyncio.CancelledError:
+            if response.prepared:
+                diagnostic_event(
+                    logging.INFO,
+                    "stream.cancelled",
+                    bytes_sent=bytes_sent,
+                    cancellation_reason="browser_disconnect_or_server_shutdown",
+                )
+                response.force_close()
+            raise
         except (ConnectionResetError, ConnectionError):
             if response.prepared:
+                diagnostic_event(
+                    logging.INFO,
+                    "stream.cancelled",
+                    bytes_sent=bytes_sent,
+                    cancellation_reason="browser_disconnect",
+                )
                 log.debug(
                     "Client disconnected during download of %s after %s bytes",
                     record["name"],
@@ -860,7 +1060,13 @@ async def stream_telegram_file(request: web.Request, record: dict[str, Any]) -> 
                 response.force_close()
                 return response
             raise
-        except Exception:
+        except Exception as exc:
+            diagnostic_event(
+                logging.ERROR,
+                "stream.failed",
+                bytes_sent=bytes_sent,
+                exception_type=type(exc).__name__,
+            )
             if response.prepared:
                 log.exception("Telegram stream ended after the browser response started")
                 response.force_close()
@@ -998,10 +1204,33 @@ async def _serve_cached_file(
                 await response.write(chunk)
                 sent += len(chunk)
             await response.write_eof()
+            diagnostic_event(
+                logging.INFO,
+                "cached_stream.complete",
+                bytes_sent=sent,
+                range_length=length,
+            )
         await touch_file_cache(record["file_id"])
     except (ConnectionResetError, ConnectionError):
+        diagnostic_event(
+            logging.INFO,
+            "cached_stream.cancelled",
+            bytes_sent=sent,
+            cancellation_reason="browser_disconnect",
+        )
         log.debug("Client disconnected during cached download of %s", record["name"])
         response.force_close()
+    except asyncio.CancelledError:
+        if response.prepared:
+            diagnostic_event(
+                logging.INFO,
+                "cached_stream.cancelled",
+                bytes_sent=sent,
+                cancellation_reason="browser_disconnect_or_server_shutdown",
+            )
+            log.debug("Cancelled cached download of %s after %s bytes", record["name"], sent)
+            response.force_close()
+        raise
     except OSError:
         if response.prepared:
             log.exception("Cached file stream failed after response headers were sent")
@@ -1012,15 +1241,113 @@ async def _serve_cached_file(
 
 
 async def download(request: web.Request) -> web.StreamResponse:
-    """Bound concurrent public transfers and reject excess load promptly."""
+    """Admit bounded transfers fairly by file and reject excess load promptly."""
+    token = request.match_info["token"]
+    request_id = uuid.uuid4().hex[:12]
+    token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+    request_id_reset = REQUEST_ID.set(request_id)
+    file_id_reset = FILE_TOKEN_ID.set(token_id)
+    loop = asyncio.get_running_loop()
+    file_downloads = ACTIVE_FILE_DOWNLOADS.get(loop)
+    if file_downloads is None:
+        file_downloads = {}
+        ACTIVE_FILE_DOWNLOADS[loop] = file_downloads
+
     semaphore = download_semaphore()
+    file_active = file_downloads.get(token_id, 0)
+    if file_active >= PER_FILE_DOWNLOAD_CONCURRENCY:
+        diagnostic_event(
+            logging.WARNING,
+            "download.rejected",
+            reject_reason="per_file_limit",
+            file_active_downloads=file_active,
+            per_file_capacity=PER_FILE_DOWNLOAD_CONCURRENCY,
+            retry_after_seconds=1,
+            admission_wait_ms=0,
+        )
+        FILE_TOKEN_ID.reset(file_id_reset)
+        REQUEST_ID.reset(request_id_reset)
+        raise web.HTTPTooManyRequests(
+            text="This file already has the maximum number of active range requests. Retry shortly.",
+            headers={"Retry-After": "1", "Cache-Control": "no-store"},
+        )
     if semaphore.locked():
+        diagnostic_event(
+            logging.WARNING,
+            "download.rejected",
+            reject_reason="global_limit",
+            retry_after_seconds=1,
+            admission_wait_ms=0,
+        )
+        FILE_TOKEN_ID.reset(file_id_reset)
+        REQUEST_ID.reset(request_id_reset)
         raise web.HTTPServiceUnavailable(
             text="The download service is busy. Please retry shortly.",
             headers={"Retry-After": "1", "Cache-Control": "no-store"},
         )
-    async with semaphore:
-        return await _download(request)
+
+    acquired = False
+    admission_started = time.monotonic()
+    try:
+        # This await completes synchronously when the non-queued semaphore has
+        # an available permit; no event-loop task can interleave between the
+        # capacity check above and this acquisition.
+        await semaphore.acquire()
+        acquired = True
+        ACTIVE_DOWNLOADS[loop] = ACTIVE_DOWNLOADS.get(loop, 0) + 1
+        file_downloads[token_id] = file_active + 1
+        diagnostic_event(
+            logging.INFO,
+            "download.start",
+            file_active_downloads=file_downloads[token_id],
+            per_file_capacity=PER_FILE_DOWNLOAD_CONCURRENCY,
+            admission_wait_ms=round((time.monotonic() - admission_started) * 1000, 1),
+            cache_status="pending",
+        )
+        try:
+            response = await _download(request)
+            diagnostic_event(
+                logging.INFO,
+                "download.response",
+                response_status=response.status,
+            )
+            return response
+        except asyncio.CancelledError:
+            transport = request.transport
+            reason = (
+                "browser_disconnect"
+                if transport is None or transport.is_closing()
+                else "server_shutdown_or_request_cancel"
+            )
+            diagnostic_event(
+                logging.INFO,
+                "download.cancelled",
+                cancellation_reason=reason,
+            )
+            raise
+        except Exception as exc:
+            diagnostic_event(
+                logging.ERROR,
+                "download.failed",
+                exception_type=type(exc).__name__,
+            )
+            raise
+    finally:
+        if acquired:
+            ACTIVE_DOWNLOADS[loop] = max(0, ACTIVE_DOWNLOADS.get(loop, 1) - 1)
+            remaining = file_downloads.get(token_id, 1) - 1
+            if remaining:
+                file_downloads[token_id] = remaining
+            else:
+                file_downloads.pop(token_id, None)
+            semaphore.release()
+            diagnostic_event(
+                logging.DEBUG,
+                "download.permit_released",
+                file_active_downloads=file_downloads.get(token_id, 0),
+            )
+        FILE_TOKEN_ID.reset(file_id_reset)
+        REQUEST_ID.reset(request_id_reset)
 
 
 async def _download(request: web.Request) -> web.StreamResponse:
@@ -1038,15 +1365,26 @@ async def _download(request: web.Request) -> web.StreamResponse:
     # --- Try locally cached file first ---
     path = cached_path(record)
     if path is not None:
+        diagnostic_event(logging.INFO, "download.cache", cache_status="hit")
         try:
             return await _serve_cached_file(request, record, path, etag)
         except FileNotFoundError:
             await clear_cache_path(str(path))
+            path = None
+
+    if path is None:
+        diagnostic_event(logging.INFO, "download.cache", cache_status="miss")
 
     # --- Try direct Telegram streaming ---
     try:
         return await stream_telegram_file(request, record)
     except Exception as stream_error:
+        diagnostic_event(
+            logging.WARNING,
+            "direct_stream.fallback",
+            exception_type=type(stream_error).__name__,
+            fallback="local_bot_api_cache",
+        )
         log.warning(
             "Direct Telegram streaming unavailable; falling back to local Bot API staging: %s",
             stream_error,
@@ -1256,6 +1594,17 @@ async def start_app() -> None:
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
         log.info("Download website listening on port %s", PORT)
+        log.info(
+            "Download limits: revision=%s downloads=%d per_file=%d streams=%d telegram_requests=%d "
+            "chunks_per_stream=%d cache_jobs=%d",
+            os.getenv("RENDER_GIT_COMMIT", "unknown"),
+            DOWNLOAD_CONCURRENCY,
+            PER_FILE_DOWNLOAD_CONCURRENCY,
+            STREAM_CONCURRENCY,
+            STREAM_REQUEST_CONCURRENCY,
+            STREAM_PIPELINE_CHUNKS,
+            CACHE_CONCURRENCY,
+        )
         try:
             TELETHON_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
             STREAM_CLIENT = TelegramClient(
@@ -1279,6 +1628,13 @@ async def start_app() -> None:
         if cleanup_task is not None:
             cleanup_task.cancel()
             await asyncio.gather(cleanup_task, return_exceptions=True)
+        cache_tasks = tuple(FILE_TASKS.values())
+        for cache_task in cache_tasks:
+            if not cache_task.done():
+                cache_task.cancel()
+        if cache_tasks:
+            await asyncio.gather(*cache_tasks, return_exceptions=True)
+        FILE_TASKS.clear()
         await runner.cleanup()
         if HTTP is not None:
             await HTTP.close()

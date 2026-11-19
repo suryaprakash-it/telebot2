@@ -7,3 +7,23 @@ __pycache__/
 *.session*
 *.sqlite*
 *.db*
+
+# Local development
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+*.log
+
+# Local development
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+*.log

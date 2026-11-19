@@ -1,70 +1,65 @@
-# Final Deployment-Readiness Verification
+# Infinity File Link — Verification Report
 
-**Project:** Infinity File Link Telegram bot
-**Verification date:** 2026-11-19
-**Final status: NOT READY**
+**Verification date:** 2026-11-19  
+**Source:** `Infinity-File-Link-FINAL.zip` extracted to a clean temporary directory  
+**Application source revision in the repository:** `85c924e` plus the uncommitted source and regression-test changes included in the archive  
+**Status:** Local verification passed; production acceptance is not verified.
 
-All local regression, build, and isolated container checks passed. Readiness is
-still **NOT READY** because actual Telegram integration and live Render service
-configuration/persistent-storage checks require credentials and access that
-are unavailable here. No production deployment was attempted and no production
-data was accessed or changed.
+## Test-count discrepancy
 
-## Results
+The ZIP's previous copy of this report recorded **139 passed**. That result describes an earlier test-suite state and was not refreshed after the concurrency regression tests were expanded. The current `tests/test_stream_concurrency.py` has 23 tests; the earlier suite had 7, adding 16 tests. The complete current ZIP suite reports **155 passed** (139 + 16). The source files in the ZIP match the working project; the discrepancy was stale report content, not a different application/test source.
 
-| Check | Status | Evidence and limits |
-| --- | --- | --- |
-| Full regression suite | **PASSED** | Final Python 3.12 full-tree run: **139 passed in 2.03s**, no skips. |
-| Python compilation and dependencies | **PASSED** | `compileall` completed for `app.py` and `tests`; `pip check` found no broken requirements. |
-| Docker Linux engine | **PASSED** | Docker Engine 29.9.3, Linux. |
-| Production image | **PASSED** | Rebuilt `infinity-file-link:verification`; final image ID `sha256:c1fb97d9d25673c8d4a87a8c999b0cebe37830f26aee4e26d6239dc6a2c0c3da`. BuildKit context was 314 bytes after ignore rules. |
-| Render image | **PASSED** | Rebuilt `infinity-file-link-render:verification`; final image ID `sha256:cea5d6f3885223bd9f45930cfa065eb66ab340d2db87949ab2ec2bc90e55adaf`. The previously completed Bot API CMake layer was reused from Docker build cache. |
-| Production container smoke | **PASSED (isolated)** | Final image reached healthy with placeholder-only configuration and `--network none`; `/healthz` returned 200, stop succeeded, and the placeholder token did not appear in logs. |
-| Render container smoke | **PASSED (isolated)** | Final image reached healthy with placeholder-only configuration and `--network none`; app `/healthz` returned 200, bundled Bot API accepted a local TCP connection on 8081, and shutdown trap ran (wrapper exit 143). Placeholder token did not appear in logs. The database path was temporary, not a Render persistent disk. |
-| Credentials/artifact inventory | **PASSED WITH LIMITATION** | A recursive workspace check found no `.env`, Telegram token-format literal, session file, or SQLite/database artifact. `.env.example` is a template. Three source/dependency `.bak` files exist under `backup/`; `.gitignore` and `.dockerignore` now exclude `backup/`, session files, and database files. BuildKit context was 314 bytes for production and 2.11 KiB for Render. This directory has no `.git` metadata, so there is no Git staging index to inspect; staged status is not applicable. |
-| FloodWait retry bounds | **PASSED (code and regression coverage)** | App retries use a finite `range(MAX_RETRIES + 1)` loop (default `MAX_RETRIES=3`, at most four app attempts per failed offset); the Telethon client has finite `request_retries=5` and `connection_retries=5`. The app honors the full Telegram wait duration and retries failed offsets only. Telethon's observed 1–2 second waits are automatically slept under its 60-second default threshold. |
-| Cancellation isolation and ranges | **PASSED (automated)** | Tests cancel one direct chunk request and close one HTTP client while another download completes. Tests also verify independent unaligned Telegram-backed ranges, exact response bytes and `Content-Range`; the full suite retains cached range, validator, HEAD, and concurrent-range coverage. Telegram calls in tests use a fake client. |
-| Cache reuse | **PASSED WITH SCOPE LIMIT** | Existing local Bot API cache hits serve concurrent full/range requests without calling Telethon. A successful direct Telethon stream is not materialized as a complete cache file; later uncached requests can read those bytes again from Telegram. |
-| Live Telegram API integration | **BLOCKED** | No Telegram bot/API credentials or archive chat were available. No live upload, archive, retrieval, or Telegram download was exercised. |
-| Live Render service/disk validation | **BLOCKED** | No Render service access/credentials were available. Actual service variables, disk attachment/retention, platform health checks, and host restart persistence were not checked. Deployment was not attempted, as requested. |
-| Standalone Bot API image | **NOT BUILT** | `telegram-bot-api.Dockerfile` is separate from the successfully built Render image. Build it only if the deployment topology uses that standalone Compose service. |
+## Exact ZIP verification
 
-## Retry, request-volume, and logging review
+The final archive `Infinity-File-Link-FINAL.zip` was extracted into a clean temporary directory and commands were run from the extracted project root.
 
-The current defaults remain unchanged: up to four aligned 512 KiB requests per
-stream batch, eight direct streams, and 16 in-flight Telegram chunk requests
-globally. Separate browsers issue independent reads and overlapping ranges may
-duplicate chunk requests, but the shared semaphore bounds concurrent API
-requests. The supplied log description alone does not show an uncontrolled
-request storm.
+```text
+python -m pytest -q
+........................................................................ [ 46%]
+........................................................................ [ 92%]
+...........                                                              [100%]
+155 passed in 3.29s
+PYTEST_EXIT_CODE 0
 
-The application does not have an unbounded FloodWait retry loop. Its retry
-count is finite; surfaced FloodWaits now wait the full requested duration. A
-partial batch retry retains successful chunks. Routine Telethon FloodWait INFO
-messages are suppressed below WARNING, while warnings/errors and successful
-stream throughput remain visible; expected browser disconnects log at DEBUG.
+python -m compileall -q app.py tests
+COMPILEALL_EXIT_CODE 0
 
-See [DOWNLOAD_CONCURRENCY_REVIEW.md](DOWNLOAD_CONCURRENCY_REVIEW.md) for the
-implementation-level analysis and focused test details.
+python -m pip check
+No broken requirements found.
+PIP_CHECK_EXIT_CODE 0
+```
 
-## Changes in this final verification
+No actual Telegram downloads, Render service inspection, or deployment were performed. The 2 GiB concurrency tests use mocked Telegram clients and a counting sink; they do not allocate real 2 GiB files or establish real-world throughput.
 
-- Added explicit ignore rules for local `backup/`, session, and database files
-  in `.gitignore` and `.dockerignore`.
-- Corrected the expired-reference retry comment to match behavior: only failed
-  offsets are retried after refreshing the reference.
-- No concurrency limits, production configuration, or application features
-  were changed in this verification.
+## Concurrency behavior
 
-## Exact remaining blockers
+Every HTTP GET or Range request takes one global download permit. A request from the same file link also counts toward that file's limit. With the documented defaults, global capacity is 10 and per-file capacity is 5. The per-file value is automatically capped to at most half of the global capacity (minimum 1). A per-file rejection returns HTTP 429 with `Retry-After: 1`; global exhaustion returns HTTP 503 with `Retry-After: 1`. Admission is immediate and does not create a waiting queue.
 
-1. Authorized non-production Telegram credentials and an archive chat are
-   needed for real Bot API/MTProto integration.
-2. Render service access or an operator-provided configuration review is
-   needed to verify environment variables and persistent disk behavior without
-   deploying from this task.
-3. Build `telegram-bot-api.Dockerfile` if the standalone Bot API image is part
-   of the intended deployment topology.
+The streaming defaults are 3 active direct streams, 4 pipelined 512 KiB Telegram chunks per stream, and 8 shared Telegram requests in flight. At those limits the maximum stream-batch payload is about 6 MiB, excluding Python objects and socket buffers. Each semaphore is created per event loop. Cache materialization is limited to one job by default; requests for the same file share a shielded task, so cancellation of one browser does not cancel work another request is awaiting.
 
-Until the live Telegram and Render checks have genuine evidence, deployment
-readiness remains **NOT READY**.
+The request diagnostics include a request ID, a truncated SHA-256 file-token identifier, active counts, limits and availability, resource wait time, cache hit/miss, completion, cancellation reason, and exception type. Full download tokens, bot tokens, and API hashes are not included in these diagnostics. Render's `RENDER_GIT_COMMIT` and effective limits are logged at app startup when available.
+
+## Regression coverage
+
+The suite includes mocked checks for concurrent logical 2 GiB streams, two files with four concurrent Range requests each, eight simultaneous Telegram chunk requests, same-file parallel requests, failure and browser-cancellation isolation, borrowed-sender reference counting, FloodWait, expired file-reference refresh, cancellation while waiting for a semaphore, permit restoration, cache/direct overlap, and capacity recovery. Existing HEAD, 206, 416, Range resume, cache fallback, bot, database, UI, and deployment-configuration tests remain in the full run.
+
+## Recommended Render settings
+
+Use these as conservative starting values for a reference 1 CPU / 2 GB service:
+
+```text
+DOWNLOAD_CONCURRENCY=10
+PER_FILE_DOWNLOAD_CONCURRENCY=5
+STREAM_CONCURRENCY=3
+STREAM_PIPELINE_CHUNKS=4
+STREAM_REQUEST_CONCURRENCY=8
+CACHE_CONCURRENCY=1
+```
+
+The stream-batch payload bound is a code-derived estimate, not measured Render memory use. Actual Render CPU, memory, and outbound-bandwidth metrics were unavailable; review them during a real transfer before changing limits. This repository has no Render service export or dashboard configuration, so production environment overrides and deployed commit remain unknown. The Render Dockerfile builds Telegram Bot API from an unpinned upstream checkout, which can change between image rebuilds.
+
+## Deployment and limitations
+
+No deployment was attempted. Deploy the updated source using `render.Dockerfile`, preserve the persistent disk at `/var/lib/telegram-bot-api`, and verify startup logs show the expected commit and limits. Then test two separate large files and interrupted Range resume with real Telegram and the live Render service. Until those checks are performed, real Telegram and Render behavior remain unverified.
+
+
