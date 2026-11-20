@@ -1,0 +1,133 @@
+# Infinity File Link — Telegram File Sharing Bot
+
+A small self-hosted Telegram bot that copies incoming files into a private Telegram channel and creates a permanent, shareable download page. The page is served by your server and streams Telegram file chunks directly to the browser, with HTTP byte ranges for download managers and resume. It avoids waiting for a full server-side copy before the download can start.
+
+## What it does
+
+- Accepts files sent to the bot or forwarded to it.
+- Copies each file into a private channel you control, so the archive message is retained in Telegram until you delete it.
+- Creates an unguessable bearer link with no expiration timer. The browser page and download button appear immediately, and the app starts streaming Telegram chunks without first staging a complete copy.
+- Serves files from your domain with `Content-Disposition: attachment`, `HEAD`, and byte-range support for browser download managers and resume. Telegram data streams to the browser as chunks arrive.
+- Keeps link metadata in SQLite. The original file remains in your Telegram archive; downloaded local cache copies are automatically cleared after 24 hours without a download.
+- Includes an optional allowlist for who can upload through the bot.
+
+## Limits and speed
+
+Telegram permits uploads up to 2 GB for regular accounts and 4 GB for Premium accounts. The official cloud Bot API only downloads files up to 20 MB. Its local Bot API server can download files without a size limit, but its documented upload limit is 2,000 MB. This project uses `copyMessage` to copy an already received Telegram message into the archive instead of uploading the media again. The web app uses Telethon's MTProto chunked download client to stream data as the browser requests it; the client disables update delivery so the local Bot API continues polling for messages. Premium is needed for a user to send a 4 GB file to Telegram in the first place. Check 4 GB forwarding with your deployed Bot API version before relying on it for important files.
+
+The download endpoint does not impose a speed cap. Each browser range stream pipelines up to 4 aligned 512 KiB Telegram requests by default, with a shared cap of 16 active Telegram requests across all streams. This can reduce delay between blocks when a single stream is latency-limited. The service also allows up to 8 simultaneous browser range streams for download managers such as 1DM. These settings can improve use of available bandwidth, but cannot guarantee 10 MB/s: Telegram, the host, the public route, and the recipient must each sustain at least 80 Mbps. Browser range support and request pipelining do not create bandwidth. Stream logs report bytes served and average MB/s, which helps identify whether the deployed route is still limiting throughput.
+
+When a local Bot API fallback has already materialized a file, later full or range requests use that cached copy without fetching chunks through Telethon. Successful direct Telethon streams are sent to the requesting browser and are not themselves saved as a complete cache file; a later uncached browser request fetches those Telegram chunks again. Separate browsers and range requests are independent, and overlapping ranges may request the same Telegram chunk.
+
+The download handler also caps active public transfers across both cached and Telegram-backed files. When the cap is full, new transfer requests receive `503 Service Unavailable` with `Retry-After: 1`; clients can retry without creating an unbounded queue of open file streams.
+It also limits simultaneous requests for the same file link; excess requests receive `429 Too Many Requests` with `Retry-After: 1`. Both limits are checked and reserved before the handler performs asynchronous work.
+
+## Setup
+
+The application and Docker images target Python 3.12. For a local test run,
+install the development requirements and execute the suite from the project
+root:
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+The tests use mocked Telegram clients and temporary SQLite/cache directories;
+they do not need Telegram credentials. To run the app outside Docker, provide
+the required environment variables from `.env.example` and run `python app.py`.
+The configured local Bot API endpoint must be running before polling begins.
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and create a **private channel** for the archive. Add the bot as an administrator with permission to post messages. Copy the channel's numeric ID (usually starts with `-100`).
+2. Get a Telegram API ID and hash from [my.telegram.org](https://my.telegram.org/apps). These are used by Telegram's local Bot API server and the direct chunk streaming client.
+3. Copy `.env.example` to `.env` and fill in the bot token, API credentials, channel ID, bot username, domain name, and public HTTPS URL. Point the domain's DNS to your server and allow inbound ports 80 and 443. Caddy in the Compose file obtains and renews HTTPS certificates automatically.
+4. Before moving this bot from Telegram's cloud Bot API to a local Bot API server for the first time, log it out of the cloud endpoint once:
+
+   ```sh
+   curl "https://api.telegram.org/bot${BOT_TOKEN}/logOut"
+   ```
+
+   Set `BOT_TOKEN` in your shell first, or substitute the token directly. This is a one-time migration step. Telegram documents a 10-minute wait before logging back into the cloud Bot API after this call.
+
+5. Build and start the app:
+
+   ```sh
+   docker compose up --build -d
+   ```
+
+6. The Compose file routes public traffic through Caddy to the app. Keep `PUBLIC_BASE_URL` set to `https://` plus `PUBLIC_HOST`. The local Bot API service must not be exposed publicly. If you already run a reverse proxy, route it to the app on port 8080 and remove or disable the Caddy service.
+
+Open the bot in Telegram and send or forward a file. The bot replies with its download page. Anyone who has the link can download that file, so treat links as private bearer credentials.
+
+## Deploying on Render
+
+For a separate non-production service, follow [STAGING_DEPLOYMENT.md](STAGING_DEPLOYMENT.md). It uses its own bot, archive, environment variables, database, session, and persistent disk.
+
+The Compose hostname `telegram-bot-api` only exists inside Docker Compose. If the app alone is deployed to Render, DNS fails with `Cannot connect to host telegram-bot-api:8081`.
+
+For Render, run the local Bot API and download app in one Web Service. The local API handles bot updates and archive copies; the app also starts a Telethon stream connection for browser downloads.
+
+1. Set the service's Dockerfile path to `render.Dockerfile` and keep it as a **Web Service**. Clear any Render Start Command or Docker Command override so the Dockerfile command runs both processes.
+2. Add `BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ARCHIVE_CHAT_ID`, `PUBLIC_BASE_URL`, and `BOT_USERNAME` in the Render environment settings.
+3. Attach a persistent disk at `/var/lib/telegram-bot-api`. The Render Dockerfile defaults `DATABASE_PATH`, `BOT_API_DATA_DIR`, and `TELEGRAM_API_BASE_URL` to paths and the localhost API endpoint on that disk. The Telethon session is saved beside the SQLite database so it survives restarts. If you already set these variables in Render, change them to `/var/lib/telegram-bot-api/files.sqlite3`, `/var/lib/telegram-bot-api`, and `http://127.0.0.1:8081` respectively.
+4. Redeploy. `run-render.sh` starts the local Telegram Bot API, waits until port 8081 is accepting connections, then starts the download app. Render supplies `PORT` for the public web server. In the deploy logs, confirm `Telegram Bot API is listening` appears. If the API process exits first or the port never opens, inspect the earlier Telegram Bot API startup lines and verify `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`; the app will now stop with a direct startup error instead of retrying localhost forever.
+
+This approach avoids the unresolved `telegram-bot-api` hostname. The Telethon session file is sensitive authentication data; keep the persistent disk private and do not add session files to source control. Persistent disks may require a paid Render plan; see Render's [disk guide](https://render.com/docs/disks). Do not use the public `https://api.telegram.org` endpoint for this large-file setup: its Bot API download limit is 20 MB.
+
+## Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `BOT_TOKEN` | Token from @BotFather. |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Credentials for the local Bot API server and the direct streaming connection. |
+| `ARCHIVE_CHAT_ID` | Private channel or supergroup where copied messages are retained. |
+| `PUBLIC_BASE_URL` | Public HTTPS origin used in generated links. |
+| `BOT_USERNAME` | Username shown on the landing page. |
+| `ALLOWED_TELEGRAM_USER_IDS` | Optional comma-separated IDs. Empty allows any Telegram user to upload. |
+| `MAX_FILE_BYTES` | Maximum accepted size; defaults to 4 GiB. |
+| `CACHE_TTL_HOURS` | Hours without a download before a local cache copy is removed; defaults to 24. The Telegram archive and link remain. |
+| `CACHE_CONCURRENCY` | Number of fallback local Bot API cache jobs to run simultaneously; defaults to 1. |
+| `STREAM_CONCURRENCY` | Maximum number of concurrent direct Telegram range streams; defaults to 8. |
+| `DOWNLOAD_CONCURRENCY` | Maximum number of concurrent public file transfers; defaults to 16. Excess downloads receive a retryable 503 response. |
+| `FILE_DOWNLOAD_CONCURRENCY` | Maximum simultaneous downloads for one file link; defaults to 8. Excess requests receive a retryable 429 response. |
+| `STREAM_PIPELINE_CHUNKS` | Number of aligned 512 KiB Telegram requests pipelined for each browser range stream; defaults to 4. |
+| `STREAM_REQUEST_CONCURRENCY` | Shared maximum number of Telegram file requests in flight across all browser streams; defaults to 16. |
+| `TELETHON_SESSION_PATH` | Path prefix for the persistent Telethon bot session; defaults to a file beside `DATABASE_PATH`. |
+| `DATABASE_PATH` | SQLite metadata database. |
+| `BOT_API_DATA_DIR` | Shared local Bot API directory where downloaded files are cached. |
+| `PUBLIC_HOST` | DNS name used by Caddy for the HTTPS download site. |
+| `PORT` | Optional loopback-only host port for the app; Caddy uses the private Compose network. |
+
+## Storage and operations
+
+The channel is the durable archive. Back up the SQLite database to preserve generated links across host failures. Local cache copies use disk space and are automatically removed after the configured idle period; the bot can fetch them from Telegram again when a link is opened. Provision enough free disk for files currently being cached. Deleting an archive message or its database row breaks the corresponding link. There is no automatic link expiry.
+
+In Docker Compose, the app and local Bot API share the `telegram-files` volume.
+The app needs that mount writable because its cache-expiry worker removes idle
+files from the shared directory. Both Docker app images check `/healthz`; the
+Render health check follows Render's `PORT` value.
+
+For a database integrity check, stop the app first and preserve a copy of the
+database plus any `-wal` and `-shm` files. Run
+`sqlite3 /path/to/files.sqlite3 'PRAGMA integrity_check;'`. If SQLite reports
+corruption, restore a known-good database backup while the app remains stopped;
+do not remove or recreate the database, since it contains the permanent link
+records. The Telegram archive preserves the file contents but cannot restore
+the original download tokens by itself.
+
+The app's `/healthz` endpoint reports whether the HTTP service is alive. Keep the bot token, API hash, database, and download links private. Anyone with a bearer link can download its file.
+
+If a browser or download manager closes a range request early, the app records it at DEBUG level as a browser disconnect. This is expected when a client cancels or replaces a range; it does not mean the Telegram stream itself failed. Telethon's routine automatic FloodWait sleep messages are also filtered below WARNING; warnings and errors remain visible.
+
+## API notes
+
+- `GET /<token>`: file information and download page.
+- `GET /download/<token>`: attachment; supports `Range` requests.
+- `HEAD /download/<token>`: attachment metadata.
+- `GET /healthz`: liveness check.
+
+## References
+
+- [Telegram Bot API: local server and file limits](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
+- [Telegram FAQ: file sizes and cloud storage](https://www.telegram.org/faq)
+- [Telegram Premium: 4 GB uploads](https://telegram.org/blog/700-million-and-premium)
