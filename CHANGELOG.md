@@ -2,8 +2,6 @@
 
 ## Unreleased — reliability and verification fixes
 
-- Replaced serial Telegram update handling with a durable SQLite inbox and bounded concurrent workers. Polling now persists each update before advancing the Bot API offset; slow `copyMessage`/`sendMessage` operations no longer block receipt of the next file. Pending work is retried and in-progress work is recovered after restart. Added per-request Bot API timeouts without changing the long-lived HTTP session timeout used by file streaming.
-
 - Kept direct Telegram range transfers bounded by the existing per-stream and
   shared request limits. Batch retries now retain successful chunks and retry
   only failed offsets; FloodWait retries wait the full reported duration.
@@ -24,6 +22,13 @@
 - Added a configurable cap for concurrent public transfers across cached and
   Telegram-backed downloads. Excess transfers receive a retryable `503` with
   `Retry-After` instead of entering an unbounded wait queue.
+- Made public transfer admission atomic before the first await and added a
+  configurable per-link cap. Excess global requests receive `503`; excess
+  requests for the same link receive `429`. Both counters release on normal
+  completion, exceptions, and cancellation. Added HTTP-level burst, recovery,
+  per-link, and cancellation regression coverage.
+- Excluded pytest/Python caches, virtual environments, temporary files, logs,
+  and ZIP archives from Git and Docker build contexts.
 - Reduced both local Bot API image builds to one CMake job after the two-job
   Render build lost its BuildKit connection on this constrained Docker host.
 - Added Docker health checks against `/healthz` for both app images and the

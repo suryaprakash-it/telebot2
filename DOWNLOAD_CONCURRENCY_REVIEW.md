@@ -1,12 +1,28 @@
 # Telegram download concurrency review
 
-**Review date:** 2026-11-19  
+**Review date:** 2026-11-20
 **Result:** Direct-download concurrency is bounded. The observed short FloodWait
 messages are not, by themselves, evidence of an uncontrolled retry loop. Two
 retry/logging fixes were justified and made; deployment concurrency values were
 not raised.
 
 ## Findings
+
+### HTTP download admission
+
+- Public downloads reserve capacity synchronously in the event-loop thread
+  before the handler's first await. The global limit defaults to 16 active
+  transfers; requests over it receive `503 Service Unavailable`.
+- A separate per-link limit defaults to eight active transfers for one token;
+  requests over it receive `429 Too Many Requests`. Both limits reject excess
+  requests immediately instead of adding them to a semaphore wait queue.
+- The reservations cover the complete aiohttp handler operation. The handler
+  streams the response before returning, so the `finally` cleanup runs only
+  after the response finishes or streaming exits on disconnect/error. The
+  cleanup decrements each reservation once, including cancellation paths.
+- HTTP tests exercise simultaneous burst admission, both rejection statuses,
+  another file link proceeding while one link is saturated, exception and
+  cancellation recovery, and client disconnect cleanup.
 
 ### Telegram request volume
 
@@ -88,7 +104,7 @@ Telegram service behavior.
 
 ## Verification
 
-Focused new regression tests: **7 passed**.  
-Complete project suite: **139 passed**.  
+Focused direct-stream regression tests: **7 passed** in the original review.
+Current complete project suite (2026-11-20): **143 passed**.
 The tests are automated with a fake Telethon client and aiohttp test server;
 they are not live Telegram integration tests.

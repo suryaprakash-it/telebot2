@@ -19,7 +19,7 @@ os.environ.update(
     {
         "BOT_TOKEN": "TEST_BOT_TOKEN_NOT_A_REAL_CREDENTIAL",
         "TELEGRAM_API_ID": "12345",
-        "TELEGRAM_API_HASH": "0123456789abcdef0123456789abcdef",
+        "TELEGRAM_API_HASH": "TEST_API_HASH_NOT_A_REAL_CREDENTIAL",
         "ARCHIVE_CHAT_ID": "-1001234567890",
         "PUBLIC_BASE_URL": "https://test.example.com",
         "DATABASE_PATH": str(Path(_test_data) / "test.sqlite3"),

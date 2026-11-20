@@ -15,6 +15,7 @@ import asyncio
 import signal
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -315,15 +316,176 @@ class TestTelegramFallback:
 
 class TestDownloadAdmission:
     @pytest.mark.asyncio
-    async def test_transfer_cap_rejects_excess_request_with_retry_after(self, client, monkeypatch):
+    async def test_global_cap_rejects_excess_request_and_recovers(
+        self, client, monkeypatch
+    ):
         loop = asyncio.get_running_loop()
-        semaphore = asyncio.Semaphore(1)
-        monkeypatch.setitem(app_module.DOWNLOAD_SEMAPHORES, loop, semaphore)
-        async with semaphore:
-            resp = await client.get("/download/not-needed-to-check-record")
-            assert resp.status == 503
-            assert resp.headers["Retry-After"] == "1"
-            assert "retry" in (await resp.text()).lower()
+        monkeypatch.setattr(app_module, "DOWNLOAD_CONCURRENCY", 1)
+        monkeypatch.setattr(app_module, "FILE_DOWNLOAD_CONCURRENCY", 8)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def held_download(_request):
+            started.set()
+            await release.wait()
+            return web.Response(text="complete")
+
+        monkeypatch.setattr(app_module, "_download", held_download)
+        first = asyncio.create_task(client.get("/download/first-file"))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            rejected = await client.get("/download/second-file")
+            assert rejected.status == 503
+            assert rejected.headers["Retry-After"] == "1"
+            assert "retry" in (await rejected.text()).lower()
+        finally:
+            release.set()
+
+        completed = await asyncio.wait_for(first, timeout=1)
+        assert completed.status == 200
+        assert await completed.text() == "complete"
+        assert app_module.DOWNLOAD_ACTIVE.get(loop, 0) == 0
+        assert loop not in app_module.FILE_DOWNLOAD_ACTIVE
+
+        recovered = await client.get("/download/third-file")
+        assert recovered.status == 200
+
+    @pytest.mark.asyncio
+    async def test_simultaneous_burst_is_rejected_without_queueing(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, "DOWNLOAD_CONCURRENCY", 2)
+        monkeypatch.setattr(app_module, "FILE_DOWNLOAD_CONCURRENCY", 32)
+        two_started = asyncio.Event()
+        release = asyncio.Event()
+        active_calls = 0
+        total_calls = 0
+
+        async def held_download(_request):
+            nonlocal active_calls, total_calls
+            active_calls += 1
+            total_calls += 1
+            if active_calls == 2:
+                two_started.set()
+            try:
+                await release.wait()
+                return web.Response(text="complete")
+            finally:
+                active_calls -= 1
+
+        monkeypatch.setattr(app_module, "_download", held_download)
+        tasks = [
+            asyncio.create_task(client.get(f"/download/burst-{index}"))
+            for index in range(12)
+        ]
+        try:
+            await asyncio.wait_for(two_started.wait(), timeout=1)
+            completed = set()
+            while len(completed) < len(tasks) - 2:
+                done, _ = await asyncio.wait(
+                    tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED
+                )
+                new_done = done - completed
+                assert new_done, "excess burst requests waited for active slots"
+                for task in new_done:
+                    response = task.result()
+                    assert response.status == 503
+                    completed.add(task)
+        finally:
+            release.set()
+
+        responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+        assert [response.status for response in responses].count(200) == 2
+        assert [response.status for response in responses].count(503) == 10
+        assert total_calls == 2
+        assert not app_module.DOWNLOAD_ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_per_file_cap_returns_429_and_allows_other_files(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, "DOWNLOAD_CONCURRENCY", 4)
+        monkeypatch.setattr(app_module, "FILE_DOWNLOAD_CONCURRENCY", 1)
+        started = {"same-file": asyncio.Event(), "other-file": asyncio.Event()}
+        release = asyncio.Event()
+
+        async def held_download(request):
+            token = request.match_info["token"]
+            started[token].set()
+            await release.wait()
+            return web.Response(text=token)
+
+        monkeypatch.setattr(app_module, "_download", held_download)
+        first = asyncio.create_task(client.get("/download/same-file"))
+        other = None
+        try:
+            await asyncio.wait_for(started["same-file"].wait(), timeout=1)
+            rejected = await client.get("/download/same-file")
+            assert rejected.status == 429
+            assert rejected.headers["Retry-After"] == "1"
+
+            other = asyncio.create_task(client.get("/download/other-file"))
+            await asyncio.wait_for(started["other-file"].wait(), timeout=1)
+        finally:
+            release.set()
+
+        first_response, other_response = await asyncio.gather(first, other)
+        assert first_response.status == other_response.status == 200
+        assert not app_module.DOWNLOAD_ACTIVE
+        assert not app_module.FILE_DOWNLOAD_ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_download_exception_releases_capacity(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "DOWNLOAD_CONCURRENCY", 1)
+        monkeypatch.setattr(app_module, "FILE_DOWNLOAD_CONCURRENCY", 2)
+        calls = 0
+
+        async def failing_once(_request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("simulated transfer failure")
+            return web.Response(text="recovered")
+
+        monkeypatch.setattr(app_module, "_download", failing_once)
+        failed = await client.get("/download/retry-file")
+        assert failed.status == 500
+        recovered = await client.get("/download/retry-file")
+        assert recovered.status == 200
+        assert await recovered.text() == "recovered"
+        assert not app_module.DOWNLOAD_ACTIVE
+        assert not app_module.FILE_DOWNLOAD_ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_cancelled_handler_releases_capacity(self, monkeypatch):
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(app_module, "DOWNLOAD_CONCURRENCY", 1)
+        monkeypatch.setattr(app_module, "FILE_DOWNLOAD_CONCURRENCY", 1)
+        started = asyncio.Event()
+        block = asyncio.Event()
+
+        async def held_download(_request):
+            started.set()
+            await block.wait()
+            return web.Response(text="unreachable")
+
+        monkeypatch.setattr(app_module, "_download", held_download)
+        request = SimpleNamespace(match_info={"token": "cancelled-file"})
+        task = asyncio.create_task(app_module.download(request))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert app_module.DOWNLOAD_ACTIVE.get(loop, 0) == 0
+        assert loop not in app_module.FILE_DOWNLOAD_ACTIVE
+
+        async def recovered(_request):
+            return web.Response(text="recovered")
+
+        monkeypatch.setattr(app_module, "_download", recovered)
+        result = await app_module.download(request)
+        assert result.status == 200
 
 
 class TestTelegramAPIErrors:
@@ -376,56 +538,18 @@ class TestTelegramAPIErrors:
 # Update polling tests
 # ═══════════════════════════════════════════════════════════════════════════════
 class TestPollUpdates:
-    """Durable update intake and worker queue behavior."""
+    """poll_updates offset persistence and error handling."""
 
     @pytest.mark.asyncio
-    async def test_enqueue_persists_payload_and_advances_offset(self, db):
-        app_module.OFFSET = 0
-        update = {"update_id": 100, "message": {"chat": {"id": 1}, "text": "hello"}}
+    async def test_offset_not_advanced_on_failure(self, db):
+        """Regression: failed update processing must NOT advance the saved offset.
 
-        assert await app_module.enqueue_update(update) == 101
-        assert await app_module.load_offset() == 101
-        claimed = await app_module.claim_next_update()
-        assert claimed == (100, update)
-
-    @pytest.mark.asyncio
-    async def test_enqueue_is_idempotent_for_duplicate_update_ids(self, db):
-        update = {"update_id": 100, "message": {"text": "first"}}
-        await app_module.enqueue_update(update)
-        await app_module.enqueue_update({"update_id": 100, "message": {"text": "duplicate"}})
-
-        claimed = await app_module.claim_next_update()
-        assert claimed == (100, update)
-        assert await app_module.claim_next_update() is None
-
-    @pytest.mark.asyncio
-    async def test_failed_worker_item_can_be_retried(self, db):
-        update = {"update_id": 101, "message": {"text": "retry me"}}
-        await app_module.enqueue_update(update)
-        claimed = await app_module.claim_next_update()
-        assert claimed == (101, update)
-
-        await app_module.retry_update(101, RuntimeError("private detail must not be stored"))
-        claimed_again = await app_module.claim_next_update()
-        assert claimed_again == (101, update)
-        async with db.execute("SELECT attempts,last_error FROM update_inbox WHERE update_id=101") as cursor:
-            row = await cursor.fetchone()
-        assert row["attempts"] == 2
-        assert row["last_error"] == "RuntimeError"
-
-    @pytest.mark.asyncio
-    async def test_finish_marks_update_processed_and_removes_inbox_item(self, db):
-        await app_module.enqueue_update({"update_id": 102, "message": {"text": "done"}})
-        await app_module.claim_next_update()
-        await app_module.finish_update(102)
-
-        assert await app_module.update_was_processed(102)
-        assert await app_module.claim_next_update() is None
-
-    @pytest.mark.asyncio
-    async def test_polling_does_not_wait_for_message_handler(self, db):
+        The original code advanced OFFSET even after on_message() raised,
+        permanently skipping the failed update.
+        """
         app_module.OFFSET = 0
         await app_module.save_offset(0)
+
         call_count = 0
 
         async def mock_telegram(method, payload=None):
@@ -433,19 +557,149 @@ class TestPollUpdates:
             if method == "getUpdates":
                 call_count += 1
                 if call_count == 1:
-                    return [{"update_id": 103, "message": {"text": "slow handler"}}]
+                    return [
+                        {"update_id": 100, "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "test"}},
+                    ]
+                raise asyncio.CancelledError()  # stop the loop on 2nd call
+            return None
+
+        with patch.object(app_module, "telegram", side_effect=mock_telegram):
+            with patch.object(app_module, "on_message", new_callable=AsyncMock) as mock_on_msg:
+                mock_on_msg.side_effect = RuntimeError("Processing failed!")
+                with pytest.raises(asyncio.CancelledError):
+                    await app_module.poll_updates()
+
+        # Offset should NOT have advanced past the failed update
+        assert app_module.OFFSET == 0
+        saved = await app_module.load_offset()
+        assert saved == 0
+
+    @pytest.mark.asyncio
+    async def test_offset_advanced_on_success(self, db):
+        """Successful processing advances the offset."""
+        app_module.OFFSET = 0
+        await app_module.save_offset(0)
+
+        call_count = 0
+
+        async def mock_telegram(method, payload=None):
+            nonlocal call_count
+            if method == "getUpdates":
+                call_count += 1
+                if call_count == 1:
+                    return [
+                        {"update_id": 100, "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "test"}},
+                    ]
                 raise asyncio.CancelledError()
             return None
 
         with patch.object(app_module, "telegram", side_effect=mock_telegram):
-            with pytest.raises(asyncio.CancelledError):
-                await app_module.poll_updates()
+            with patch.object(app_module, "on_message", new_callable=AsyncMock):
+                with pytest.raises(asyncio.CancelledError):
+                    await app_module.poll_updates()
 
-        assert app_module.OFFSET == 104
-        assert await app_module.load_offset() == 104
-        # The update is durably queued; poll_updates never calls on_message.
-        claimed = await app_module.claim_next_update()
-        assert claimed == (103, {"update_id": 103, "message": {"text": "slow handler"}})
+        assert app_module.OFFSET == 101
+        saved = await app_module.load_offset()
+        assert saved == 101
+
+    @pytest.mark.asyncio
+    async def test_duplicate_updates_handled_safely(self, db):
+        """Processing the same update_id twice should not cause errors."""
+        app_module.OFFSET = 0
+        await app_module.save_offset(0)
+
+        call_count = 0
+
+        async def mock_telegram(method, payload=None):
+            nonlocal call_count
+            if method == "getUpdates":
+                call_count += 1
+                if call_count <= 2:
+                    return [
+                        {"update_id": 100, "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "test"}},
+                    ]
+                raise asyncio.CancelledError()
+            return None
+
+        process_count = 0
+
+        async def counting_on_message(msg):
+            nonlocal process_count
+            process_count += 1
+
+        with patch.object(app_module, "telegram", side_effect=mock_telegram):
+            with patch.object(app_module, "on_message", side_effect=counting_on_message):
+                with pytest.raises(asyncio.CancelledError):
+                    await app_module.poll_updates()
+
+        # Update 100 is processed successfully the first time, offset advances to 101.
+        # On the second getUpdates call, the server returns update_id=100 again
+        # (simulating duplicate), but since OFFSET is now 101 and in reality the
+        # server wouldn't return it, we just verify no crash.
+        assert app_module.OFFSET == 101
+
+    @pytest.mark.asyncio
+    async def test_telegram_polling_failure_retries(self, db):
+        """Telegram API failures should not crash the loop."""
+        app_module.OFFSET = 0
+
+        call_count = 0
+
+        async def mock_telegram(method, payload=None):
+            nonlocal call_count
+            if method == "getUpdates":
+                call_count += 1
+                if call_count == 1:
+                    raise app_module.TelegramError("Temporary API failure")
+                if call_count == 2:
+                    raise asyncio.CancelledError()
+            return None
+
+        with patch.object(app_module, "telegram", side_effect=mock_telegram):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(asyncio.CancelledError):
+                    await app_module.poll_updates()
+
+        assert call_count == 2  # First failed, second cancelled
+
+    @pytest.mark.asyncio
+    async def test_failed_offset_commit_retries_without_acknowledging(self, db):
+        app_module.OFFSET = 0
+        await app_module.save_offset(0)
+        response_count = 0
+        offsets = []
+
+        async def mock_telegram(method, payload=None):
+            nonlocal response_count
+            if method != "getUpdates":
+                return None
+            offsets.append(payload["offset"])
+            response_count += 1
+            if response_count <= 2:
+                return [{"update_id": 70, "message": {"text": "retry"}}]
+            raise asyncio.CancelledError()
+
+        original_commit = app_module.commit_update
+        attempts = 0
+
+        async def fail_once(update_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("temporary sqlite failure")
+            return await original_commit(update_id)
+
+        with patch.object(app_module, "telegram", side_effect=mock_telegram):
+            with patch.object(app_module, "on_message", new_callable=AsyncMock) as handler:
+                with patch.object(app_module, "commit_update", side_effect=fail_once):
+                    with patch("asyncio.sleep", new_callable=AsyncMock):
+                        with pytest.raises(asyncio.CancelledError):
+                            await app_module.poll_updates()
+
+        assert handler.await_count == 2
+        assert offsets[:2] == [0, 0]
+        assert app_module.OFFSET == 71
+        assert await app_module.load_offset() == 71
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
